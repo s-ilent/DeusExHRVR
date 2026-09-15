@@ -14,9 +14,9 @@ name: build
 
 on:
   push:
-    branches: [main, luma-port]
+    branches: [main, luma-port, gog-support]
   pull_request:
-    branches: [main, luma-port]
+    branches: [main, luma-port, gog-support]
 
 jobs:
   build-windows:
