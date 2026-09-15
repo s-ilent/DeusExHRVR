@@ -26,11 +26,21 @@ Other executable versions and the original non-Director's Cut release are not su
 
 1. Extract the release archive.
 2. Close Deus Ex and connect the headset.
-3. Open PowerShell in the extracted `DeusExHRVR` folder and run the following, replacing the example with your installation path:
+3. Install from the extracted `DeusExHRVR` folder, replacing the example with your installation path.
+
+   **Windows (PowerShell):**
 
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\install.ps1 -GameDirectory "E:\SteamLibrary\steamapps\common\Deus Ex Human Revolution Director's Cut"
    ```
+
+   **Linux / Proton (bash):**
+
+   ```bash
+   ./install.sh "/path/to/your/SteamLibrary/steamapps/common/Deus Ex Human Revolution Director's Cut"
+   ```
+
+   The bash installer sets the Wine prefix graphics registry keys (`EnableDirectX11=1`, `StereoMode=1`, `EnableVSync=0`, `AntiAliasingMode=0`) via `wine reg add` when a Wine binary is on `PATH`, or by editing `user.reg` directly as a fallback. Set `WINEPREFIX` (or `PROTON_PREFIX`) if your prefix isn't the default.
 
 4. Launch `DXHRDC.exe` and load a save. Gameplay enters full VR automatically. Press **F9** to recenter if needed.
 
@@ -118,13 +128,21 @@ The game's stereo separation/convergence sliders do not calibrate tracked VR: th
 
 ## Restore the original game
 
-Close the game and run `uninstall.ps1` with the same game path:
+Close the game and run the uninstaller with the same game path.
+
+**Windows (PowerShell):**
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -GameDirectory "E:\SteamLibrary\steamapps\common\Deus Ex Human Revolution Director's Cut"
 ```
 
-The backup restores original files and graphics settings. Logs, captures, and the backup remain local.
+**Linux / Proton (bash):**
+
+```bash
+./uninstall.sh "/path/to/your/SteamLibrary/steamapps/common/Deus Ex Human Revolution Director's Cut"
+```
+
+The backup restores original files. On Linux the uninstaller removes the four graphics registry keys the installer set (it doesn't restore pre-existing values, since Wine prefix registry inspection is fragile — re-set them in-game if needed). Logs, captures, and the backup remain local.
 
 ## How it works
 
