@@ -4,7 +4,19 @@ $gameRoot=(Resolve-Path -LiteralPath $GameDirectory).Path
 $exe=Join-Path $gameRoot 'DXHRDC.exe'
 if(!(Test-Path -LiteralPath $exe)){throw 'DXHRDC.exe not found.'}
 if(Get-Process DXHRDC -ErrorAction SilentlyContinue){throw 'Close Deus Ex before installation.'}
-if((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash -ne '8266B6B4A5BF25F2F4E8DE068AA3720F6289C962BB1C2BB70A7B1C111BA510A1'){throw 'This build is staged for the inspected Steam DXHRDC 2.0.66.0 executable only.'}
+# Validate the EXE by PE header fields (TimeDateStamp + SizeOfImage), matching
+# the checks the C++ hooks perform at runtime (EngineCamera.cpp Install() and
+# EngineDisplay.cpp InstallOnce()). This accepts both the Steam and GOG builds
+# of Director's Cut 2.0.66.0, which share these header values and the same
+# code layout at the hook RVAs despite different SHA256 hashes (the builds
+# differ only in non-code sections — DRM stubs, GOG Galaxy integration, etc.).
+$bytes=[System.IO.File]::ReadAllBytes($exe)
+$e_lfanew=[BitConverter]::ToInt32($bytes,0x3c)
+$timestamp=[BitConverter]::ToUInt32($bytes,$e_lfanew+8)
+$sizeOfImage=[BitConverter]::ToUInt32($bytes,$e_lfanew+80)
+if($timestamp -ne 0x52840914 -or $sizeOfImage -ne 0x01c54000){
+    throw "Unsupported DXHRDC.exe build (TimeDateStamp=0x$($timestamp.ToString('x8')), SizeOfImage=0x$($sizeOfImage.ToString('x8'))). This mod supports Director's Cut 2.0.66.0 (Steam and GOG)."
+}
 $payload=Join-Path $PSScriptRoot 'dist'
 $files=@('d3d11.dll','atidxx32.dll','atiadlxy.dll','DeusExHRVR\DeusExHRVRHost.exe')
 foreach($f in $files){if(!(Test-Path -LiteralPath (Join-Path $payload $f))){throw "Missing payload: $f"}}

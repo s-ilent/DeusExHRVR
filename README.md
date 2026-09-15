@@ -8,10 +8,18 @@ Gameplay stereo, headset tracking, HUD alignment, motion-controlled weapon aimin
 
 Download the packaged build from [Releases](https://github.com/farmerarmor/DeusExHRVR/releases). GitHub's automatic source ZIP does not contain compiled DLLs.
 
-Supported game: **Steam Director's Cut 2.0.66.0**, executable SHA256:
+Supported game: **Director's Cut 2.0.66.0** (Steam and GOG). Both distributions share the same executable build (PE TimeDateStamp `0x52840914`, SizeOfImage `0x01c54000`) and identical code layout at all hook addresses; they differ only in non-code sections (DRM stubs, GOG Galaxy integration). The installer validates the PE header rather than a single SHA256, so both are accepted automatically.
+
+Steam executable SHA256 (for reference):
 
 ```text
 8266B6B4A5BF25F2F4E8DE068AA3720F6289C962BB1C2BB70A7B1C111BA510A1
+```
+
+GOG executable SHA256 (for reference):
+
+```text
+509409E94DDC0585E2C17B6BD289BB1440A20EA9AEBE6865C24163D2AD6BCEEB
 ```
 
 Other executable versions and the original non-Director's Cut release are not supported by this build. Requires Windows, DirectX 11, a PC-connected headset, and an active OpenXR runtime. The initial test used the Oculus runtime. Installation does not change the system runtime.
