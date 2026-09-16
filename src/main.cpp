@@ -225,9 +225,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
 
     // EXPERIMENT 5: Enumerate vs Create discrepancy (all exts)
+    // Per-extension progress is logged BEFORE the call: a hard crash in the
+    // Unix thunk kills the process silently, and the last flushed line then
+    // names the offending extension.
     Log("\n--- EXPERIMENT 5: Enumerate vs Create discrepancy ---\n");
     int discrepancyCount = 0;
+    size_t idx = 0;
     for (auto& name : allExtNames) {
+        Log("  [%zu/%zu] testing %s\n", idx + 1, allExtNames.size(), name.c_str());
         float prio = 1.0f;
         VkDeviceQueueCreateInfo qci = {}; qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
         qci.queueFamilyIndex = graphicsQf; qci.queueCount = 1; qci.pQueuePriorities = &prio;
@@ -239,8 +244,52 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         r = vkCreateDevice(phys, &dci, nullptr, &dev);
         if (dev) vkDestroyDevice(dev, nullptr);
         if (r != VK_SUCCESS) { Log("  DISCREPANCY: %s -> %d\n", extName, r); discrepancyCount++; }
+        idx++;
     }
     Log("(%d discrepancies found)\n", discrepancyCount);
+
+    // EXPERIMENT 6: Wine VR ICD extensions individually.
+    // The console of the previous run showed a hard vkCreateDevice crash
+    // (0xc0000005 in Unix call) inside GE-Proton's xalia companion while its
+    // OpenVR/OpenXR extension providers were active, and the device reports
+    // VK_WINE_openvr/openxr_device_extensions. Test them in isolation.
+    Log("\n--- EXPERIMENT 6: Wine VR ICD extensions individually ---\n");
+    {
+        const char* wineVr[] = { "VK_WINE_openvr_device_extensions", "VK_WINE_openxr_device_extensions" };
+        for (size_t i = 0; i < 2; i++) {
+            Log("  testing alone: %s\n", wineVr[i]);
+            float prio = 1.0f;
+            VkDeviceQueueCreateInfo qci = {}; qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+            qci.queueFamilyIndex = graphicsQf; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+            VkDeviceCreateInfo dci = {}; dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+            dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+            dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &wineVr[i];
+            VkDevice dev = VK_NULL_HANDLE;
+            r = vkCreateDevice(phys, &dci, nullptr, &dev);
+            if (dev) vkDestroyDevice(dev, nullptr);
+            Log("  %s -> %d (%s)\n", wineVr[i], r, r == VK_SUCCESS ? "SUCCESS" : "FAILED");
+        }
+    }
+
+    // EXPERIMENT 7: Full DXVK set + Wine OpenXR device extension combined.
+    // If DXVK's D3D11 path ever requests the OpenXR-augmented extensions the
+    // game process could hit the same crash; this probes that combination.
+    Log("\n--- EXPERIMENT 7: Full DXVK set + VK_WINE_openxr_device_extensions ---\n");
+    {
+        std::vector<const char*> combined(dxvkFullSet, dxvkFullSet + fullCount);
+        combined.push_back("VK_WINE_openxr_device_extensions");
+        Log("  testing %zu extensions together\n", combined.size());
+        float prio = 1.0f;
+        VkDeviceQueueCreateInfo qci = {}; qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        qci.queueFamilyIndex = graphicsQf; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+        VkDeviceCreateInfo dci = {}; dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+        dci.enabledExtensionCount = (uint32_t)combined.size(); dci.ppEnabledExtensionNames = combined.data();
+        VkDevice dev = VK_NULL_HANDLE;
+        r = vkCreateDevice(phys, &dci, nullptr, &dev);
+        if (dev) vkDestroyDevice(dev, nullptr);
+        Log("Result: %d (%s)\n", r, r == VK_SUCCESS ? "SUCCESS" : "FAILED");
+    }
 
     vkDestroyInstance(inst, nullptr);
     Log("\n=== Probe complete ===\n");
