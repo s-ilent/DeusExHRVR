@@ -9,10 +9,11 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch Vulkan headers (from repo tarball)
+      - name: Fetch Vulkan headers
         shell: pwsh
         run: |
-          $url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/main.tar.gz"
+          # codeload.github.com serves branch tarballs
+          $url = "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/refs/heads/main"
           Write-Host "Downloading..."
           Invoke-WebRequest -Uri $url -OutFile vk.tar.gz -TimeoutSec 120
           tar xzf vk.tar.gz
