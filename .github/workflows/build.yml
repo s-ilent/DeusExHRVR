@@ -12,11 +12,11 @@ jobs:
       - name: Fetch Vulkan headers (from repo tarball)
         shell: pwsh
         run: |
-          $url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.313.0.tar.gz"
+          $url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/main.tar.gz"
           Write-Host "Downloading..."
           Invoke-WebRequest -Uri $url -OutFile vk.tar.gz -TimeoutSec 120
           tar xzf vk.tar.gz
-          $dir = "Vulkan-Headers-1.4.313.0"
+          $dir = "Vulkan-Headers-main"
           echo "VK_INCLUDE=$PWD\$dir\include" >> $env:GITHUB_ENV
           Write-Host "Headers at: $PWD\$dir\include"
       - name: Set up MSVC (x86)
