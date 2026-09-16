@@ -138,12 +138,21 @@ typedef BOOL (WINAPI* PFN_IsWindowedStereoEnabled)(IDXGIFactory2*);
 typedef HRESULT (WINAPI* PFN_CreateSwapChainForHwnd)(
     IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+typedef HRESULT (WINAPI* PFN_CreateSwapChainForCoreWindow)(
+    IDXGIFactory2*, IUnknown*, void*, const DXGI_SWAP_CHAIN_DESC1*,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGISwapChain1**);
+typedef HRESULT (WINAPI* PFN_CreateSwapChainForComposition)(
+    IDXGIFactory2*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGISwapChain1**);
 
 static PFN_IsWindowedStereoEnabled g_pfnIsWindowedStereoEnabled = nullptr;
 static PFN_CreateSwapChainForHwnd  g_pfnCreateSwapChainForHwnd  = nullptr;
+static PFN_CreateSwapChainForCoreWindow g_pfnCreateSwapChainForCoreWindow = nullptr;
+static PFN_CreateSwapChainForComposition g_pfnCreateSwapChainForComposition = nullptr;
 
 static bool g_bIsWindowedStereoHooked     = false;
 static bool g_bCreateSCForHwndHooked      = false;
+static bool g_bCreateSCForCoreWindowHooked = false;
+static bool g_bCreateSCForCompositionHooked = false;
 
 // MinHook trampolines for CreateDXGIFactory*
 typedef HRESULT (WINAPI* PFN_CreateFactory)(REFIID, void**);
@@ -154,6 +163,11 @@ static PFN_CreateFactory  g_pfnOrigCreateFactory1 = nullptr;
 static PFN_CreateFactory2 g_pfnOrigCreateFactory2 = nullptr;
 
 // ---- Hook implementations -------------------------------------------------
+
+static HRESULT WINAPI HookedOutGetModeList(IDXGIOutput* pOut, DXGI_FORMAT fmt, UINT flags, UINT* pNum, DXGI_MODE_DESC* pDesc);
+static HRESULT WINAPI HookedOutFindClosest(IDXGIOutput* pOut, const DXGI_MODE_DESC* pMatch, DXGI_MODE_DESC* pClosest);
+static HRESULT WINAPI HookedOutGetModeList1(IDXGIOutput1* pOut, DXGI_FORMAT fmt, UINT flags, UINT* pNum, DXGI_MODE_DESC1* pDesc);
+static HRESULT WINAPI HookedOutFindClosest1(IDXGIOutput1* pOut, const DXGI_MODE_DESC1* pMatch, DXGI_MODE_DESC1* pClosest);
 
 static HRESULT WINAPI HookedGetDesc(IDXGIAdapter* pAdapter, DXGI_ADAPTER_DESC* pDesc)
 {
@@ -188,6 +202,14 @@ static void HookAdapter(IDXGIAdapter* pA);
 static HRESULT WINAPI HookedEnumAdapters(IDXGIFactory* pFactory, UINT Adapter, IDXGIAdapter** ppAdapter)
 {
     HRESULT hr = g_pfnEnumAdapters(pFactory, Adapter, ppAdapter);
+    static int s_n = 0;
+    ++s_n;
+    if (s_n <= 24 || (s_n % 200) == 0)
+    {
+        char buf[128];
+        wsprintfA(buf, "[D3d11Proxy] EnumAdapters(%u) -> 0x%08X\n", Adapter, (unsigned)hr);
+        WriteLog(buf);
+    }
     if (SUCCEEDED(hr) && ppAdapter && *ppAdapter)
         HookAdapter(*ppAdapter);
     return hr;
@@ -196,8 +218,163 @@ static HRESULT WINAPI HookedEnumAdapters(IDXGIFactory* pFactory, UINT Adapter, I
 static HRESULT WINAPI HookedEnumAdapters1(IDXGIFactory1* pFactory, UINT Adapter, IDXGIAdapter1** ppAdapter)
 {
     HRESULT hr = g_pfnEnumAdapters1(pFactory, Adapter, ppAdapter);
+    static int s_n = 0;
+    ++s_n;
+    if (s_n <= 24 || (s_n % 200) == 0)
+    {
+        char buf[128];
+        wsprintfA(buf, "[D3d11Proxy] EnumAdapters1(%u) -> 0x%08X\n", Adapter, (unsigned)hr);
+        WriteLog(buf);
+    }
     if (SUCCEEDED(hr) && ppAdapter && *ppAdapter)
         HookAdapter(static_cast<IDXGIAdapter*>(*ppAdapter));
+    return hr;
+}
+
+// ---- IDXGIAdapter::EnumOutputs + IDXGIOutput mode-query hooks --------------
+// The game's flat-vs-stereo decision may consult plain DXGI output mode
+// queries (including GetDisplayModeList1 with DXGI_ENUM_MODES_STEREO) in
+// addition to the AMD QB extension path. Those calls go straight to the
+// real dxgi (DXVK) and are otherwise invisible in HD3D_dxgi.log.
+typedef HRESULT (WINAPI* PFN_EnumOutputs)(IDXGIAdapter*, UINT, IDXGIOutput**);
+typedef HRESULT (WINAPI* PFN_OutGetModeList)(IDXGIOutput*, DXGI_FORMAT, UINT, UINT*, DXGI_MODE_DESC*);
+typedef HRESULT (WINAPI* PFN_OutFindClosest)(IDXGIOutput*, const DXGI_MODE_DESC*, DXGI_MODE_DESC*);
+typedef HRESULT (WINAPI* PFN_OutGetModeList1)(IDXGIOutput1*, DXGI_FORMAT, UINT, UINT*, DXGI_MODE_DESC1*);
+typedef HRESULT (WINAPI* PFN_OutFindClosest1)(IDXGIOutput1*, const DXGI_MODE_DESC1*, DXGI_MODE_DESC1*);
+
+static PFN_EnumOutputs            g_pfnEnumOutputs     = nullptr;
+static PFN_OutGetModeList         g_pfnOutGetModeList  = nullptr;
+static PFN_OutFindClosest         g_pfnOutFindClosest  = nullptr;
+static PFN_OutGetModeList1        g_pfnOutGetModeList1 = nullptr;
+static PFN_OutFindClosest1        g_pfnOutFindClosest1 = nullptr;
+static bool g_bEnumOutputsHooked    = false;
+static bool g_bOutModeHooksInstalled = false;
+
+static void HookOutput(IDXGIOutput* pOut);
+
+static HRESULT WINAPI HookedEnumOutputs(IDXGIAdapter* pAdapter, UINT Output, IDXGIOutput** ppOutput)
+{
+    HRESULT hr = g_pfnEnumOutputs(pAdapter, Output, ppOutput);
+    static int s_n = 0;
+    ++s_n;
+    if (s_n <= 24 || (s_n % 200) == 0)
+    {
+        char buf[128];
+        wsprintfA(buf, "[D3d11Proxy] EnumOutputs(%u) -> 0x%08X\n", Output, (unsigned)hr);
+        WriteLog(buf);
+    }
+    if (SUCCEEDED(hr) && ppOutput && *ppOutput)
+        HookOutput(*ppOutput);
+    return hr;
+}
+
+static void HookOutput(IDXGIOutput* pOut)
+{
+    if (g_bOutModeHooksInstalled || !pOut) return;
+    IDXGIOutput1* pOut1 = nullptr;
+    if (FAILED(pOut->QueryInterface(__uuidof(IDXGIOutput1),
+            reinterpret_cast<void**>(&pOut1))))
+        return;
+    // IDXGIOutput vtable: 7=GetDesc, 8=GetDisplayModeList, 9=FindClosestMatchingMode,
+    // (IDXGIOutput1:) 14=GetDisplayModeList1, 15=FindClosestMatchingMode1.
+    void** vt = *reinterpret_cast<void***>(pOut1);
+    bool ok = true;
+    if (MH_CreateHook(vt[8], &HookedOutGetModeList,
+            reinterpret_cast<void**>(&g_pfnOutGetModeList)) == MH_OK)
+        MH_EnableHook(vt[8]);
+    else ok = false;
+    if (MH_CreateHook(vt[9], &HookedOutFindClosest,
+            reinterpret_cast<void**>(&g_pfnOutFindClosest)) == MH_OK)
+        MH_EnableHook(vt[9]);
+    else ok = false;
+    if (MH_CreateHook(vt[14], &HookedOutGetModeList1,
+            reinterpret_cast<void**>(&g_pfnOutGetModeList1)) == MH_OK)
+        MH_EnableHook(vt[14]);
+    else ok = false;
+    if (MH_CreateHook(vt[15], &HookedOutFindClosest1,
+            reinterpret_cast<void**>(&g_pfnOutFindClosest1)) == MH_OK)
+        MH_EnableHook(vt[15]);
+    else ok = false;
+    pOut1->Release();
+    if (ok)
+    {
+        g_bOutModeHooksInstalled = true;
+        WriteLog("[D3d11Proxy] IDXGIOutput mode-query hooks installed\n");
+    }
+}
+
+static HRESULT WINAPI HookedOutGetModeList(IDXGIOutput* pOut, DXGI_FORMAT fmt,
+    UINT flags, UINT* pNum, DXGI_MODE_DESC* pDesc)
+{
+    HRESULT hr = g_pfnOutGetModeList(pOut, fmt, flags, pNum, pDesc);
+    static int s_n = 0;
+    ++s_n;
+    if (s_n <= 16 || (s_n % 200) == 0)
+    {
+        char buf[192];
+        wsprintfA(buf, "[D3d11Proxy] IDXGIOutput::GetDisplayModeList(fmt=%u flags=0x%X) -> 0x%08X %u modes\n",
+                  (UINT)fmt, flags, (unsigned)hr,
+                  (hr == S_OK && pNum) ? *pNum : 0);
+        WriteLog(buf);
+    }
+    return hr;
+}
+
+static HRESULT WINAPI HookedOutGetModeList1(IDXGIOutput1* pOut, DXGI_FORMAT fmt,
+    UINT flags, UINT* pNum, DXGI_MODE_DESC1* pDesc)
+{
+    HRESULT hr = g_pfnOutGetModeList1(pOut, fmt, flags, pNum, pDesc);
+    static int s_n = 0;
+    ++s_n;
+    if (s_n <= 16 || (s_n % 200) == 0)
+    {
+        char buf[224];
+        wsprintfA(buf, "[D3d11Proxy] IDXGIOutput1::GetDisplayModeList1(fmt=%u flags=0x%X%s) -> 0x%08X %u modes\n",
+                  (UINT)fmt, flags, (flags & 0x2) ? " [STEREO]" : "",
+                  (unsigned)hr, (hr == S_OK && pNum) ? *pNum : 0);
+        WriteLog(buf);
+    }
+    return hr;
+}
+
+static HRESULT WINAPI HookedOutFindClosest(IDXGIOutput* pOut,
+    const DXGI_MODE_DESC* pMatch, DXGI_MODE_DESC* pClosest)
+{
+    HRESULT hr = g_pfnOutFindClosest(pOut, pMatch, pClosest);
+    static int s_n = 0;
+    ++s_n;
+    if (s_n <= 16 || (s_n % 200) == 0)
+    {
+        char buf[224];
+        if (pMatch)
+            wsprintfA(buf, "[D3d11Proxy] IDXGIOutput::FindClosestMatchingMode(%ux%u fmt=%u) -> 0x%08X\n",
+                      pMatch->Width, pMatch->Height, (UINT)pMatch->Format, (unsigned)hr);
+        else
+            wsprintfA(buf, "[D3d11Proxy] IDXGIOutput::FindClosestMatchingMode(null) -> 0x%08X\n",
+                      (unsigned)hr);
+        WriteLog(buf);
+    }
+    return hr;
+}
+
+static HRESULT WINAPI HookedOutFindClosest1(IDXGIOutput1* pOut,
+    const DXGI_MODE_DESC1* pMatch, DXGI_MODE_DESC1* pClosest)
+{
+    HRESULT hr = g_pfnOutFindClosest1(pOut, pMatch, pClosest);
+    static int s_n = 0;
+    ++s_n;
+    if (s_n <= 16 || (s_n % 200) == 0)
+    {
+        char buf[256];
+        if (pMatch)
+            wsprintfA(buf, "[D3d11Proxy] IDXGIOutput1::FindClosestMatchingMode1(%ux%u fmt=%u stereo=%d) -> 0x%08X\n",
+                      pMatch->Width, pMatch->Height, (UINT)pMatch->Format,
+                      (int)pMatch->Stereo, (unsigned)hr);
+        else
+            wsprintfA(buf, "[D3d11Proxy] IDXGIOutput1::FindClosestMatchingMode1(null) -> 0x%08X\n",
+                      (unsigned)hr);
+        WriteLog(buf);
+    }
     return hr;
 }
 
@@ -255,6 +432,17 @@ static void HookAdapter(IDXGIAdapter* pA)
 {
     void** vt = *reinterpret_cast<void***>(pA);
 
+    if (!g_bEnumOutputsHooked)
+    {
+        if (MH_CreateHook(vt[7], &HookedEnumOutputs,
+                reinterpret_cast<void**>(&g_pfnEnumOutputs)) == MH_OK)
+        {
+            MH_EnableHook(vt[7]);
+            g_bEnumOutputsHooked = true;
+            WriteLog("[D3d11Proxy] IDXGIAdapter::EnumOutputs hooked\n");
+        }
+    }
+
     if (!g_bGetDescHooked)
     {
         if (MH_CreateHook(vt[8], &HookedGetDesc,
@@ -281,6 +469,41 @@ static void HookAdapter(IDXGIAdapter* pA)
         }
         pA1->Release();
     }
+}
+
+static HRESULT WINAPI HookedCreateSwapChainForCoreWindow(
+    IDXGIFactory2* pFactory, IUnknown* pDevice, void* pCoreWindow,
+    const DXGI_SWAP_CHAIN_DESC1* pDesc,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
+    IDXGISwapChain1** ppSwapChain)
+{
+    char buf[256];
+    wsprintfA(buf, "[D3d11Proxy] CreateSwapChainForCoreWindow(%ux%u fmt=%u full=%d)\n",
+              pDesc ? pDesc->Width : 0, pDesc ? pDesc->Height : 0,
+              pDesc ? (UINT)pDesc->Format : 0,
+              pFullscreenDesc ? 1 : 0);
+    WriteLog(buf);
+    HRESULT hr = g_pfnCreateSwapChainForCoreWindow(
+        pFactory, pDevice, pCoreWindow, pDesc, pFullscreenDesc, ppSwapChain);
+    wsprintfA(buf, "[D3d11Proxy] CreateSwapChainForCoreWindow -> 0x%08X\n", (unsigned)hr);
+    WriteLog(buf);
+    return hr;
+}
+
+static HRESULT WINAPI HookedCreateSwapChainForComposition(
+    IDXGIFactory2* pFactory, IUnknown* pDevice,
+    const DXGI_SWAP_CHAIN_DESC1* pDesc, IDXGISwapChain1** ppSwapChain)
+{
+    char buf[256];
+    wsprintfA(buf, "[D3d11Proxy] CreateSwapChainForComposition(%ux%u fmt=%u)\n",
+              pDesc ? pDesc->Width : 0, pDesc ? pDesc->Height : 0,
+              pDesc ? (UINT)pDesc->Format : 0);
+    WriteLog(buf);
+    HRESULT hr = g_pfnCreateSwapChainForComposition(
+        pFactory, pDevice, pDesc, ppSwapChain);
+    wsprintfA(buf, "[D3d11Proxy] CreateSwapChainForComposition -> 0x%08X\n", (unsigned)hr);
+    WriteLog(buf);
+    return hr;
 }
 
 static void HookFactory(void* pRaw)
@@ -355,6 +578,26 @@ static void HookFactory(void* pRaw)
                 MH_EnableHook(vt2[15]);
                 g_bCreateSCForHwndHooked = true;
                 WriteLog("[D3d11Proxy] IDXGIFactory2::CreateSwapChainForHwnd hooked\n");
+            }
+        }
+        if (!g_bCreateSCForCoreWindowHooked)
+        {
+            if (MH_CreateHook(vt2[16], &HookedCreateSwapChainForCoreWindow,
+                    reinterpret_cast<void**>(&g_pfnCreateSwapChainForCoreWindow)) == MH_OK)
+            {
+                MH_EnableHook(vt2[16]);
+                g_bCreateSCForCoreWindowHooked = true;
+                WriteLog("[D3d11Proxy] IDXGIFactory2::CreateSwapChainForCoreWindow hooked\n");
+            }
+        }
+        if (!g_bCreateSCForCompositionHooked)
+        {
+            if (MH_CreateHook(vt2[17], &HookedCreateSwapChainForComposition,
+                    reinterpret_cast<void**>(&g_pfnCreateSwapChainForComposition)) == MH_OK)
+            {
+                MH_EnableHook(vt2[17]);
+                g_bCreateSCForCompositionHooked = true;
+                WriteLog("[D3d11Proxy] IDXGIFactory2::CreateSwapChainForComposition hooked\n");
             }
         }
         pF2->Release();
@@ -1373,6 +1616,58 @@ static void LogGameGfxReadFailed(int idx, LSTATUS r)
     WriteLog(buf);
 }
 
+// Log ANY value read from the game Graphics key, not only the three owned
+// settings. The game's flat-vs-stereo decision is driven by values this
+// build does not own (fullscreen/resolution/refresh state) — make every
+// read visible so the decision inputs can be correlated with the QB probe.
+// Rate-limited per value name: first 4 reads, then every 100th.
+static void LogGameGfxRawRead(const char* api, const char* nameA,
+                              LSTATUS r, DWORD type, const BYTE* data, DWORD cb)
+{
+    if (!nameA || !nameA[0]) nameA = "(default)";
+    struct Rate { char name[64]; DWORD count; };
+    static Rate s_rates[32] = {};
+    static int  s_rateCount = 0;
+    Rate* slot = nullptr;
+    for (int i = 0; i < s_rateCount; ++i)
+        if (lstrcmpiA(s_rates[i].name, nameA) == 0) { slot = &s_rates[i]; break; }
+    if (!slot && s_rateCount < 32)
+    {
+        slot = &s_rates[s_rateCount++];
+        lstrcpynA(slot->name, nameA, 64);
+        slot->count = 0;
+    }
+    DWORD n = slot ? ++slot->count : 1;
+    if (!slot || (n > 4 && (n % 100) != 0)) return;
+
+    char buf[384];
+    if (r != ERROR_SUCCESS)
+    {
+        wsprintfA(buf, "[D3d11Proxy] %s(Game Graphics, %s) -> status=%ld (read #%lu)\n",
+                  api, nameA, (long)r, (unsigned long)n);
+    }
+    else if (type == REG_DWORD && data && cb >= sizeof(DWORD))
+    {
+        wsprintfA(buf, "[D3d11Proxy] %s(Game Graphics, %s) = DWORD %lu (read #%lu)\n",
+                  api, nameA, (unsigned long)*reinterpret_cast<const DWORD*>(data),
+                  (unsigned long)n);
+    }
+    else if (type == REG_SZ && data && cb >= 2)
+    {
+        char val[192] = {};
+        WideCharToMultiByte(CP_ACP, 0, reinterpret_cast<LPCWSTR>(data), -1,
+                            val, sizeof(val) - 1, nullptr, nullptr);
+        wsprintfA(buf, "[D3d11Proxy] %s(Game Graphics, %s) = SZ \"%s\" (read #%lu)\n",
+                  api, nameA, val, (unsigned long)n);
+    }
+    else
+    {
+        wsprintfA(buf, "[D3d11Proxy] %s(Game Graphics, %s) = type=%lu cb=%lu (read #%lu)\n",
+                  api, nameA, (unsigned long)type, (unsigned long)cb, (unsigned long)n);
+    }
+    WriteLog(buf);
+}
+
 static LSTATUS WINAPI HookedRegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey,
     DWORD ulOptions, REGSAM samDesired, PHKEY phkResult)
 {
@@ -1499,6 +1794,12 @@ static LSTATUS WINAPI HookedRegQueryValueExA(HKEY hKey, LPCSTR lpValueName,
             else
                 LogGameGfxReadFailed(gi, r);
         }
+        else
+        {
+            LogGameGfxRawRead("RegQueryValueExA", lpValueName, r,
+                              lpType ? *lpType : 0, lpData,
+                              lpcbData ? *lpcbData : 0);
+        }
     }
 
     if (IsTrackedKey(hKey) && lpValueName)
@@ -1591,6 +1892,15 @@ static LSTATUS WINAPI HookedRegQueryValueExW(HKEY hKey, LPCWSTR lpValueName,
             else
                 LogGameGfxReadFailed(gi, r);
         }
+        else
+        {
+            char narrowName[128] = {};
+            WideCharToMultiByte(CP_ACP, 0, lpValueName, -1,
+                                narrowName, sizeof(narrowName) - 1, nullptr, nullptr);
+            LogGameGfxRawRead("RegQueryValueExW", narrowName, r,
+                              lpType ? *lpType : 0, lpData,
+                              lpcbData ? *lpcbData : 0);
+        }
     }
 
     if (IsTrackedKey(hKey) && lpValueName)
@@ -1677,6 +1987,7 @@ static LSTATUS WINAPI HookedRegGetValueA(HKEY hKey, LPCSTR lpSubKey,
     if (lpValue)
     {
         int gi = -1;
+        bool gfxKey = (lpSubKey && IsGameGfxKeyPathA(lpSubKey)) || IsGraphicsKey(hKey);
         if (lpSubKey && IsGameGfxKeyPathA(lpSubKey))
             gi = MatchGameGfxSettingA(lpValue);
         else if (IsGraphicsKey(hKey))
@@ -1688,6 +1999,13 @@ static LSTATUS WINAPI HookedRegGetValueA(HKEY hKey, LPCSTR lpSubKey,
                                     (dwFlags & RRF_RT_REG_DWORD) != 0);
             else
                 LogGameGfxReadFailed(gi, r);
+        }
+        else if (gfxKey)
+        {
+            LogGameGfxRawRead("RegGetValueA", lpValue, r,
+                              pdwType ? *pdwType : 0,
+                              static_cast<const BYTE*>(pvData),
+                              pcbData ? *pcbData : 0);
         }
     }
 
@@ -1771,6 +2089,7 @@ static LSTATUS WINAPI HookedRegGetValueW(HKEY hKey, LPCWSTR lpSubKey,
     if (lpValue)
     {
         int gi = -1;
+        bool gfxKey = (lpSubKey && IsGameGfxKeyPathW(lpSubKey)) || IsGraphicsKey(hKey);
         if (lpSubKey && IsGameGfxKeyPathW(lpSubKey))
             gi = MatchGameGfxSettingW(lpValue);
         else if (IsGraphicsKey(hKey))
@@ -1782,6 +2101,16 @@ static LSTATUS WINAPI HookedRegGetValueW(HKEY hKey, LPCWSTR lpSubKey,
                                     (dwFlags & RRF_RT_REG_DWORD) != 0);
             else
                 LogGameGfxReadFailed(gi, r);
+        }
+        else if (gfxKey)
+        {
+            char narrowName[128] = {};
+            WideCharToMultiByte(CP_ACP, 0, lpValue, -1,
+                                narrowName, sizeof(narrowName) - 1, nullptr, nullptr);
+            LogGameGfxRawRead("RegGetValueW", narrowName, r,
+                              pdwType ? *pdwType : 0,
+                              static_cast<const BYTE*>(pvData),
+                              pcbData ? *pcbData : 0);
         }
     }
 

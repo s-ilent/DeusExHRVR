@@ -308,6 +308,13 @@ static std::unordered_map<IDXGISwapChain*, ShadowData> g_scShadow;
 static HRESULT STDMETHODCALLTYPE HookSetFullscreen(IDXGISwapChain* sc,BOOL fullscreen,IDXGIOutput* output) {
     auto it=g_scShadow.find(sc);
     if(HeadsetDisplay::Active() && it!=g_scShadow.end()){it->second.virtualFullscreen=fullscreen!=FALSE;return S_OK;}
+    static int s_nFs = 0; ++s_nFs;
+    if (s_nFs <= 16 || (s_nFs % 200) == 0) {
+        char buf[128];
+        wsprintfA(buf, "[AmdQbProxy] SetFullscreenState(%d, out=%p) SC=%p\n",
+                  fullscreen ? 1 : 0, (void*)output, (void*)sc);
+        WriteLog(buf);
+    }
     return originalSetFullscreen(sc,fullscreen,output);
 }
 static HRESULT STDMETHODCALLTYPE HookGetFullscreen(IDXGISwapChain* sc,BOOL* fullscreen,IDXGIOutput** output) {
@@ -887,6 +894,10 @@ public:
         if (r == 0)
         {
             WriteLog("[AmdQbProxy] FakeAmdDxExtQbStereo destroyed\n");
+            if (!g_bStereoActive && !g_scShadow.empty())
+                WriteLog("[AmdQbProxy] NOTE: QB released without EnableQuadBufferStereo but shadow swapchains exist\n");
+            else if (!g_bStereoActive)
+                WriteLog("[AmdQbProxy] NOTE: QB released without EnableQuadBufferStereo - game did not activate HD3D stereo\n");
             delete this;
         }
         return r;
