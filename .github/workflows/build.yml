@@ -79,8 +79,8 @@ jobs:
                  else { "dev-$($env:GITHUB_SHA.Substring(0,7))" }
           $stage = "bundle/DeusExHRVR-$ver"
           New-Item -ItemType Directory -Force -Path "$stage/dist/DeusExHRVR/shaders/dxhr" | Out-Null
-          Copy-Item install.sh, uninstall.sh, install.ps1, uninstall.ps1, $stage/
-          Copy-Item README.md, LICENSE, DeusExHRVR.ini.example, THIRD_PARTY_NOTICES.md, $stage/
+          Copy-Item -Path install.sh, uninstall.sh, install.ps1, uninstall.ps1 -Destination $stage/
+          Copy-Item -Path README.md, LICENSE, DeusExHRVR.ini.example, THIRD_PARTY_NOTICES.md -Destination $stage/
           Copy-Item build-x86/bin/Release/*.dll "$stage/dist/"
           Copy-Item build-x64/bin/Release/DeusExHRVRHost.exe "$stage/dist/DeusExHRVR/"
           Copy-Item shaders/dxhr/table.csv "$stage/dist/DeusExHRVR/shaders/dxhr/"
