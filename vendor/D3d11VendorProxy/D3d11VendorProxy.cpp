@@ -68,6 +68,27 @@ static void WriteLog(const char* msg)
 
 static FARPROC RealD3D11(const char* name)
 {
+    // Self-pin: prevent the proxy from being unloaded by transient
+    // load/unload cycles (e.g. GOG Galaxy or the game probing d3d11.dll then
+    // FreeLibrary'ing it). Under Proton/DXVK, if the proxy unloads and
+    // reloads, this function may resolve a different d3d11.dll (Wine's
+    // builtin instead of DXVK's), causing D3D11CreateDevice to fail with
+    // E_FAIL (0x80004005). Loading our own module increments its refcount so
+    // a single FreeLibrary can't drop it to 0. This runs outside DllMain (the
+    // first export call triggers it), so no loader-lock concern.
+    static bool s_pinned = false;
+    if (!s_pinned)
+    {
+        s_pinned = true;
+        wchar_t selfPath[MAX_PATH];
+        if (GetModuleFileNameW(g_hSelf, selfPath, MAX_PATH) && selfPath[0])
+        {
+            HMODULE hPin = LoadLibraryW(selfPath);
+            (void)hPin; // refcount-only, never freed
+            WriteLog("[D3d11Proxy] self-pinned to prevent unload\n");
+        }
+    }
+
     if (!g_hRealD3D11 && g_sysDir[0])
     {
         wchar_t path[MAX_PATH];
