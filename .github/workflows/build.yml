@@ -8,6 +8,9 @@ name: build
 #   2. Builds the 64-bit OpenXR host (DeusExHRVRHost) + probes
 #   3. Compiles Luma's DXHR replacement shaders to .cso with fxc
 #   4. Regenerates shaders/dxhr/table.csv
+#   5. Assembles a ready-to-install bundle (DLLs + host + shaders + the
+#      install.sh/install.ps1 installers) and publishes it as an artifact —
+#      and as a GitHub Release when the ref is a v* tag.
 # A green run means the C++ (incl. the ShaderSwap port) compiles on MSVC and
 # every replacement shader compiles with fxc. Runtime/in-headset validation
 # still happens on a Windows PC.
@@ -15,8 +18,12 @@ name: build
 on:
   push:
     branches: [main, luma-port, gog-support]
+    tags: ['v*']
   pull_request:
     branches: [main, luma-port, gog-support]
+
+permissions:
+  contents: write
 
 jobs:
   build-windows:
@@ -63,3 +70,36 @@ jobs:
             shaders/dxhr/table.csv
             shaders/dxhr/compiled/*.cso
           if-no-files-found: warn
+
+      - name: Assemble install bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME }
+                 else { "dev-$($env:GITHUB_SHA.Substring(0,7))" }
+          $stage = "bundle/DeusExHRVR-$ver"
+          New-Item -ItemType Directory -Force -Path "$stage/dist/DeusExHRVR/shaders/dxhr" | Out-Null
+          Copy-Item install.sh, uninstall.sh, install.ps1, uninstall.ps1, $stage/
+          Copy-Item README.md, LICENSE, DeusExHRVR.ini.example, THIRD_PARTY_NOTICES.md, $stage/
+          Copy-Item build-x86/bin/Release/*.dll "$stage/dist/"
+          Copy-Item build-x64/bin/Release/DeusExHRVRHost.exe "$stage/dist/DeusExHRVR/"
+          Copy-Item shaders/dxhr/table.csv "$stage/dist/DeusExHRVR/shaders/dxhr/"
+          if (Test-Path shaders/dxhr/compiled) {
+            Copy-Item shaders/dxhr/compiled "$stage/dist/DeusExHRVR/shaders/dxhr/" -Recurse
+          }
+          Compress-Archive -Path $stage -DestinationPath "bundle/DeusExHRVR-$ver.zip"
+          "BUNDLE_ZIP=DeusExHRVR-$ver.zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload install bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeusExHRVR-install-bundle
+          path: bundle/*.zip
+          if-no-files-found: error
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bundle/*.zip
+          generate_release_notes: true

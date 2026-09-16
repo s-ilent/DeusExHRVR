@@ -37,5 +37,12 @@ if(!(Test-Path -LiteralPath $manifestPath)) {
     @{version=1;gameRoot=$gameRoot;files=$entries;settings=$settings} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding utf8
 }
 foreach($f in $files){$target=Join-Path $gameRoot $f;New-Item -ItemType Directory -Path (Split-Path $target) -Force|Out-Null;Copy-Item -LiteralPath (Join-Path $payload $f) -Destination $target -Force}
+# Sync the mod-owned payload folder (host + compiled shaders + table.csv).
+$payloadMod=Join-Path $payload 'DeusExHRVR'
+if(Test-Path -LiteralPath $payloadMod){
+    New-Item -ItemType Directory -Path (Join-Path $gameRoot 'DeusExHRVR') -Force|Out-Null
+    Copy-Item -Path (Join-Path $payloadMod '*') -Destination (Join-Path $gameRoot 'DeusExHRVR') -Recurse -Force
+}
 foreach($key in $changes.Keys){New-ItemProperty -LiteralPath $regPath -Name $key -Value $changes[$key] -PropertyType DWord -Force|Out-Null}
 'Installed native stereo bridge. Original files/settings are in '+$backupRoot
+'Note: the mod DLL also applies and enforces EnableDirectX11/StereoMode/EnableVSync itself on every launch.'

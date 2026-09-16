@@ -40,7 +40,9 @@ Other executable versions and the original non-Director's Cut release are not su
    ./install.sh "/path/to/your/SteamLibrary/steamapps/common/Deus Ex Human Revolution Director's Cut"
    ```
 
-   The bash installer sets the Wine prefix graphics registry keys (`EnableDirectX11=1`, `StereoMode=1`, `EnableVSync=0`, `AntiAliasingMode=0`) via `wine reg add` when a Wine binary is on `PATH`, or by editing `user.reg` directly as a fallback. Set `WINEPREFIX` (or `PROTON_PREFIX`) if your prefix isn't the default.
+   The bash installer is Proton-aware. Point it at the prefix with `--prefix DIR` (env: `PROTON_PREFIX`, `WINEPREFIX`, `UMU_PREFIX`), pick a Wine binary with `--wine BIN` or a Proton install with `--proton DIR`, or let it auto-detect Steam/Proton-GE/umu Proton installations. `--umu` prefers `umu-run`, and `--no-registry` skips the registry step entirely.
+
+   The registry step pre-seeds `EnableDirectX11=1`, `StereoMode=1`, `EnableVSync=0`, `AntiAliasingMode=0` under `HKCU\Software\Eidos\Deus Ex: HRDC\Graphics`. This is belt-and-braces only: the mod DLL itself applies and enforces the VR-critical settings (`EnableDirectX11`, `StereoMode`, `EnableVSync`) in-process on every launch, so a skipped or clobbered registry step is no longer fatal. Every enforcement is logged to `HD3D_dxgi.log` (`ApplyVR config:` and `Game read ... ENFORCED` lines).
 
 4. Launch `DXHRDC.exe` and load a save. Gameplay enters full VR automatically. Press **F9** to recenter if needed.
 

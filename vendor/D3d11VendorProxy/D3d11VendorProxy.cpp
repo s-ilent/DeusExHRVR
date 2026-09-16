@@ -1179,6 +1179,200 @@ static bool IsAmdRegistryPathW(LPCWSTR s)
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// VR graphics-settings ownership --------------------------------------------
+//
+// The game reads its renderer/stereo toggles from
+//   HKCU\Software\Eidos\Deus Ex: HRDC\Graphics
+// Two field findings make pre-seeded installs unreliable:
+//   * hand-copied DLL installs (Proton) never run the installer registry step;
+//   * the game itself rewrites EnableDirectX11 (observed: installer set 1,
+//     next boot read 0), so even a persisted value cannot be trusted.
+// The proxy therefore OWNS the VR-critical values: it persists them once per
+// launch (first D3D11 device request, outside the loader lock) and enforces
+// them on every registry read the game makes after the proxy loaded. Every
+// enforcement is logged, so HD3D_dxgi.log shows exactly what the game asked
+// for and what it got.
+
+static const wchar_t* const kGameGfxKeyPathW =
+    L"Software\\Eidos\\Deus Ex: HRDC\\Graphics";
+static const char*    const kGameGfxKeyPathA =
+    "Software\\Eidos\\Deus Ex: HRDC\\Graphics";
+static const wchar_t* const kGameGfxParentPathW =
+    L"Software\\Eidos\\Deus Ex: HRDC";
+static const char*    const kGameGfxParentPathA =
+    "Software\\Eidos\\Deus Ex: HRDC";
+
+struct GameGfxSetting
+{
+    const wchar_t* name;
+    DWORD          want;
+};
+
+// EnableDirectX11: DX11 renderer is required for the HD3D stereo path
+//                  (observed 0 after the game rewrote a persisted 1).
+// StereoMode:      engine stereoscopic rendering path.
+// EnableVSync:     VR compositor paces via DXGI_PRESENT_DO_NOT_WAIT.
+static const GameGfxSetting kGameGfxSettings[] = {
+    { L"EnableDirectX11", 1 },
+    { L"StereoMode",      1 },
+    { L"EnableVSync",     0 },
+};
+static const int kGameGfxSettingCount =
+    sizeof(kGameGfxSettings) / sizeof(kGameGfxSettings[0]);
+
+static const char* const kGameGfxSettingsA[] = {
+    "EnableDirectX11", "StereoMode", "EnableVSync",
+};
+
+// Case-insensitive suffix compare (registry paths may differ in case).
+static bool EndsWithNoCaseW(const wchar_t* s, const wchar_t* suffix)
+{
+    if (!s || !suffix) return false;
+    size_t ls = wcslen(s), lf = wcslen(suffix);
+    if (ls < lf) return false;
+    for (size_t i = 0; i < lf; ++i)
+    {
+        wchar_t a = s[ls - lf + i], b = suffix[i];
+        if (a >= L'A' && a <= L'Z') a += L'a' - L'A';
+        if (b >= L'A' && b <= L'Z') b += L'a' - L'A';
+        if (a != b) return false;
+    }
+    return true;
+}
+
+static bool EndsWithNoCaseA(const char* s, const char* suffix)
+{
+    if (!s || !suffix) return false;
+    size_t ls = strlen(s), lf = strlen(suffix);
+    if (ls < lf) return false;
+    for (size_t i = 0; i < lf; ++i)
+    {
+        char a = s[ls - lf + i], b = suffix[i];
+        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+        if (a != b) return false;
+    }
+    return true;
+}
+
+static bool IsGameGfxKeyPathW(LPCWSTR s)
+{
+    return s && EndsWithNoCaseW(s, kGameGfxKeyPathW);
+}
+static bool IsGameGfxKeyPathA(LPCSTR s)
+{
+    return s && EndsWithNoCaseA(s, kGameGfxKeyPathA);
+}
+static bool IsGameGfxParentPathW(LPCWSTR s)
+{
+    return s && EndsWithNoCaseW(s, kGameGfxParentPathW);
+}
+static bool IsGameGfxParentPathA(LPCSTR s)
+{
+    return s && EndsWithNoCaseA(s, kGameGfxParentPathA);
+}
+
+// Keys opened on the game Graphics key (and the parent HRDC key, so a
+// two-step open of "Graphics" is still caught).
+static HKEY g_gfxKeys[16]       = {};
+static int  g_gfxKeyCount       = 0;
+static HKEY g_gfxParentKeys[16] = {};
+static int  g_gfxParentKeyCount = 0;
+
+static void TrackGraphicsKey(HKEY k)
+{
+    if (k && g_gfxKeyCount < 16) g_gfxKeys[g_gfxKeyCount++] = k;
+}
+static bool IsGraphicsKey(HKEY k)
+{
+    for (int i = 0; i < g_gfxKeyCount; ++i)
+        if (g_gfxKeys[i] == k) return true;
+    return false;
+}
+static void TrackGraphicsParentKey(HKEY k)
+{
+    if (k && g_gfxParentKeyCount < 16) g_gfxParentKeys[g_gfxParentKeyCount++] = k;
+}
+static bool IsGraphicsParentKey(HKEY k)
+{
+    for (int i = 0; i < g_gfxParentKeyCount; ++i)
+        if (g_gfxParentKeys[i] == k) return true;
+    return false;
+}
+
+static int MatchGameGfxSettingW(LPCWSTR name)
+{
+    if (!name) return -1;
+    for (int i = 0; i < kGameGfxSettingCount; ++i)
+        if (lstrcmpiW(name, kGameGfxSettings[i].name) == 0) return i;
+    return -1;
+}
+static int MatchGameGfxSettingA(LPCSTR name)
+{
+    if (!name) return -1;
+    for (int i = 0; i < kGameGfxSettingCount; ++i)
+        if (lstrcmpiA(name, kGameGfxSettingsA[i]) == 0) return i;
+    return -1;
+}
+
+// Rewrite a successfully-read DWORD for one of the owned settings.
+// typeKnown: *pdwType validated REG_DWORD, or the caller forced RRF_RT_REG_DWORD.
+// Once-per-setting logging keeps HD3D_dxgi.log readable if a value is polled
+// per frame. Returns true when the caller's buffer was rewritten.
+static bool EnforceGameGfxDword(int idx, LPDWORD pdwType, void* pvData,
+                                DWORD cbData, bool typeKnown)
+{
+    if (idx < 0 || idx >= kGameGfxSettingCount || !pvData || cbData < sizeof(DWORD))
+        return false;
+    if (pdwType)
+    {
+        if (*pdwType != REG_DWORD) return false;
+    }
+    else if (!typeKnown)
+        return false;
+
+    DWORD have = *reinterpret_cast<DWORD*>(pvData);
+    DWORD want = kGameGfxSettings[idx].want;
+    static bool s_logged[8] = {};
+    if (have == want)
+    {
+        if (!s_logged[idx])
+        {
+            char buf[160];
+            wsprintfA(buf, "[D3d11Proxy] Game read %ls = %lu (matches VR config)\n",
+                      kGameGfxSettings[idx].name, (unsigned long)have);
+            WriteLog(buf);
+            s_logged[idx] = true;
+        }
+        return false;
+    }
+    *reinterpret_cast<DWORD*>(pvData) = want;
+    if (!s_logged[idx])
+    {
+        char buf[192];
+        wsprintfA(buf, "[D3d11Proxy] Game read %ls = %lu -> ENFORCED %lu (VR config)\n",
+                  kGameGfxSettings[idx].name, (unsigned long)have, (unsigned long)want);
+        WriteLog(buf);
+        s_logged[idx] = true;
+    }
+    return true;
+}
+
+// Log (once per setting) that the game probed an owned value and the read
+// failed — e.g. the value is missing from the key at that read site.
+static void LogGameGfxReadFailed(int idx, LSTATUS r)
+{
+    if (idx < 0 || idx >= kGameGfxSettingCount) return;
+    static bool s_logged[8] = {};
+    if (s_logged[idx]) return;
+    s_logged[idx] = true;
+    char buf[160];
+    wsprintfA(buf, "[D3d11Proxy] Game read %ls -> status=%ld (missing at read site)\n",
+              kGameGfxSettings[idx].name, (long)r);
+    WriteLog(buf);
+}
+
 static LSTATUS WINAPI HookedRegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey,
     DWORD ulOptions, REGSAM samDesired, PHKEY phkResult)
 {
@@ -1194,6 +1388,31 @@ static LSTATUS WINAPI HookedRegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey,
 #endif
 
     LSTATUS r = g_pfnRegOpenKeyExA(hKey, lpSubKey, ulOptions, samDesired, phkResult);
+
+    // VR settings: track opens on the game Graphics key so later
+    // RegQueryValueEx* calls can be enforced.
+    if (lpSubKey)
+    {
+        if (IsGameGfxKeyPathA(lpSubKey))
+        {
+            char gfxbuf[160];
+            wsprintfA(gfxbuf, "[D3d11Proxy] RegOpenKeyExA(Game Graphics) -> %ld\n", (long)r);
+            WriteLog(gfxbuf);
+            if (r == ERROR_SUCCESS && phkResult) TrackGraphicsKey(*phkResult);
+        }
+        else if (IsGameGfxParentPathA(lpSubKey) && r == ERROR_SUCCESS && phkResult)
+        {
+            TrackGraphicsParentKey(*phkResult);
+        }
+        else if (IsGraphicsParentKey(hKey) && lstrcmpiA(lpSubKey, "Graphics") == 0)
+        {
+            char gfxbuf[160];
+            wsprintfA(gfxbuf, "[D3d11Proxy] RegOpenKeyExA(Game Graphics, child of HRDC) -> %ld\n", (long)r);
+            WriteLog(gfxbuf);
+            if (r == ERROR_SUCCESS && phkResult) TrackGraphicsKey(*phkResult);
+        }
+    }
+
     bool tracked = IsTrackedKey(hKey);
     if (lpSubKey && (IsAmdRegistryPathA(lpSubKey) || tracked))
     {
@@ -1224,6 +1443,31 @@ static LSTATUS WINAPI HookedRegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey,
 #endif
 
     LSTATUS r = g_pfnRegOpenKeyExW(hKey, lpSubKey, ulOptions, samDesired, phkResult);
+
+    // VR settings: track opens on the game Graphics key so later
+    // RegQueryValueEx* calls can be enforced.
+    if (lpSubKey)
+    {
+        if (IsGameGfxKeyPathW(lpSubKey))
+        {
+            char gfxbuf[160];
+            wsprintfA(gfxbuf, "[D3d11Proxy] RegOpenKeyExW(Game Graphics) -> %ld\n", (long)r);
+            WriteLog(gfxbuf);
+            if (r == ERROR_SUCCESS && phkResult) TrackGraphicsKey(*phkResult);
+        }
+        else if (IsGameGfxParentPathW(lpSubKey) && r == ERROR_SUCCESS && phkResult)
+        {
+            TrackGraphicsParentKey(*phkResult);
+        }
+        else if (IsGraphicsParentKey(hKey) && lstrcmpiW(lpSubKey, L"Graphics") == 0)
+        {
+            char gfxbuf[160];
+            wsprintfA(gfxbuf, "[D3d11Proxy] RegOpenKeyExW(Game Graphics, child of HRDC) -> %ld\n", (long)r);
+            WriteLog(gfxbuf);
+            if (r == ERROR_SUCCESS && phkResult) TrackGraphicsKey(*phkResult);
+        }
+    }
+
     bool tracked = IsTrackedKey(hKey);
     if (lpSubKey && (IsAmdRegistryPathW(lpSubKey) || tracked))
     {
@@ -1243,6 +1487,20 @@ static LSTATUS WINAPI HookedRegQueryValueExA(HKEY hKey, LPCSTR lpValueName,
     LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData)
 {
     LSTATUS r = g_pfnRegQueryValueExA(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
+
+    // VR settings enforcement on tracked game Graphics keys.
+    if (lpValueName && IsGraphicsKey(hKey))
+    {
+        int gi = MatchGameGfxSettingA(lpValueName);
+        if (gi >= 0)
+        {
+            if (r == ERROR_SUCCESS)
+                EnforceGameGfxDword(gi, lpType, lpData, lpcbData ? *lpcbData : 0, false);
+            else
+                LogGameGfxReadFailed(gi, r);
+        }
+    }
+
     if (IsTrackedKey(hKey) && lpValueName)
     {
         char buf[512];
@@ -1321,6 +1579,20 @@ static LSTATUS WINAPI HookedRegQueryValueExW(HKEY hKey, LPCWSTR lpValueName,
     LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData)
 {
     LSTATUS r = g_pfnRegQueryValueExW(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
+
+    // VR settings enforcement on tracked game Graphics keys.
+    if (lpValueName && IsGraphicsKey(hKey))
+    {
+        int gi = MatchGameGfxSettingW(lpValueName);
+        if (gi >= 0)
+        {
+            if (r == ERROR_SUCCESS)
+                EnforceGameGfxDword(gi, lpType, lpData, lpcbData ? *lpcbData : 0, false);
+            else
+                LogGameGfxReadFailed(gi, r);
+        }
+    }
+
     if (IsTrackedKey(hKey) && lpValueName)
     {
         char narrowName[256] = {};
@@ -1401,6 +1673,24 @@ static LSTATUS WINAPI HookedRegGetValueA(HKEY hKey, LPCSTR lpSubKey,
 {
     LSTATUS r = g_pfnRegGetValueA(hKey, lpSubKey, lpValue, dwFlags, pdwType, pvData, pcbData);
 
+    // VR settings enforcement (one-shot API: subkey carries the path).
+    if (lpValue)
+    {
+        int gi = -1;
+        if (lpSubKey && IsGameGfxKeyPathA(lpSubKey))
+            gi = MatchGameGfxSettingA(lpValue);
+        else if (IsGraphicsKey(hKey))
+            gi = MatchGameGfxSettingA(lpValue);
+        if (gi >= 0)
+        {
+            if (r == ERROR_SUCCESS)
+                EnforceGameGfxDword(gi, pdwType, pvData, pcbData ? *pcbData : 0,
+                                    (dwFlags & RRF_RT_REG_DWORD) != 0);
+            else
+                LogGameGfxReadFailed(gi, r);
+        }
+    }
+
     bool tracked = IsTrackedKey(hKey);
     if (!tracked && lpSubKey && IsAmdRegistryPathA(lpSubKey))
         tracked = true;
@@ -1476,6 +1766,24 @@ static LSTATUS WINAPI HookedRegGetValueW(HKEY hKey, LPCWSTR lpSubKey,
     LPCWSTR lpValue, DWORD dwFlags, LPDWORD pdwType, PVOID pvData, LPDWORD pcbData)
 {
     LSTATUS r = g_pfnRegGetValueW(hKey, lpSubKey, lpValue, dwFlags, pdwType, pvData, pcbData);
+
+    // VR settings enforcement (one-shot API: subkey carries the path).
+    if (lpValue)
+    {
+        int gi = -1;
+        if (lpSubKey && IsGameGfxKeyPathW(lpSubKey))
+            gi = MatchGameGfxSettingW(lpValue);
+        else if (IsGraphicsKey(hKey))
+            gi = MatchGameGfxSettingW(lpValue);
+        if (gi >= 0)
+        {
+            if (r == ERROR_SUCCESS)
+                EnforceGameGfxDword(gi, pdwType, pvData, pcbData ? *pcbData : 0,
+                                    (dwFlags & RRF_RT_REG_DWORD) != 0);
+            else
+                LogGameGfxReadFailed(gi, r);
+        }
+    }
 
     bool tracked = IsTrackedKey(hKey);
     if (!tracked && lpSubKey && IsAmdRegistryPathW(lpSubKey))
@@ -1889,6 +2197,103 @@ static void LogGameGraphicsConfig()
     WriteLog(buf);
 }
 
+// Persist the VR-critical graphics settings so they hold for later reads this
+// session and for the next launch even if the game rewrites them on exit.
+// Runs once, on the first D3D11 device request (outside DllMain loader lock),
+// next to LogGameGraphicsConfig(). Reads the game makes AFTER this point are
+// additionally enforced in the hooked registry APIs above; anything the game
+// read before the proxy loaded sees these persisted values next launch.
+// AntiAliasingMode is intentionally NOT touched (user preference).
+static void ApplyGameGraphicsConfig()
+{
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+
+    // Resolve the writers directly from advapi32; the Reg* hooks above live on
+    // the KernelBase trampolines, and our reads use the unhooked trampoline so
+    // the logged "current" value is the true stored one.
+    typedef LSTATUS (WINAPI* PFN_RegCreateKeyExW_t)(HKEY, LPCWSTR, DWORD, LPWSTR,
+                                                    DWORD, REGSAM,
+                                                    const SECURITY_ATTRIBUTES*,
+                                                    PHKEY, LPDWORD);
+    typedef LSTATUS (WINAPI* PFN_RegSetValueExW_t)(HKEY, LPCWSTR, DWORD, DWORD,
+                                                   const BYTE*, DWORD);
+    typedef LSTATUS (WINAPI* PFN_RegGetValueW_t)(HKEY, LPCWSTR, LPCWSTR, DWORD,
+                                                 LPDWORD, PVOID, LPDWORD);
+    HMODULE hAdv = GetModuleHandleW(L"advapi32.dll");
+    if (!hAdv) hAdv = LoadLibraryW(L"advapi32.dll");
+    if (!hAdv)
+    {
+        WriteLog("[D3d11Proxy] ApplyVR config: advapi32 unavailable, settings not persisted\n");
+        return;
+    }
+    PFN_RegCreateKeyExW_t createKey =
+        (PFN_RegCreateKeyExW_t)(void*)GetProcAddress(hAdv, "RegCreateKeyExW");
+    PFN_RegSetValueExW_t  setValue  =
+        (PFN_RegSetValueExW_t)(void*)GetProcAddress(hAdv, "RegSetValueExW");
+    PFN_RegGetValueW_t    getVal    = g_pfnRegGetValueW
+        ? reinterpret_cast<PFN_RegGetValueW_t>(g_pfnRegGetValueW)
+        : reinterpret_cast<PFN_RegGetValueW_t>(&RegGetValueW);
+    if (!createKey || !setValue)
+    {
+        WriteLog("[D3d11Proxy] ApplyVR config: RegCreateKeyExW/RegSetValueExW missing\n");
+        return;
+    }
+
+    HKEY hk = nullptr;
+    LSTATUS st = createKey(HKEY_CURRENT_USER, kGameGfxKeyPathW, 0, nullptr,
+                           REG_OPTION_NON_VOLATILE,
+                           KEY_SET_VALUE | KEY_QUERY_VALUE, nullptr, &hk, nullptr);
+    if (st != ERROR_SUCCESS || !hk)
+    {
+        char buf[160];
+        wsprintfA(buf, "[D3d11Proxy] ApplyVR config: cannot open Graphics key (status=%ld)\n",
+                  (long)st);
+        WriteLog(buf);
+        return;
+    }
+
+    int okCount = 0;
+    for (int i = 0; i < kGameGfxSettingCount; ++i)
+    {
+        const wchar_t* name = kGameGfxSettings[i].name;
+        DWORD want = kGameGfxSettings[i].want;
+        DWORD data = 0, size = sizeof(data), type = 0;
+        LSTATUS rd = getVal(hk, nullptr, name, RRF_RT_REG_DWORD, &type, &data, &size);
+        if (rd == ERROR_SUCCESS && data == want)
+        {
+            ++okCount;
+            continue;
+        }
+        DWORD v = want;
+        LSTATUS wr = setValue(hk, name, 0, REG_DWORD,
+                              reinterpret_cast<const BYTE*>(&v), sizeof(v));
+        char buf[192];
+        if (wr == ERROR_SUCCESS)
+        {
+            ++okCount;
+            if (rd == ERROR_SUCCESS)
+                wsprintfA(buf, "[D3d11Proxy] ApplyVR config: %ls %lu -> %lu (persisted)\n",
+                          name, (unsigned long)data, (unsigned long)want);
+            else
+                wsprintfA(buf, "[D3d11Proxy] ApplyVR config: %ls MISSING -> %lu (persisted)\n",
+                          name, (unsigned long)want);
+        }
+        else
+            wsprintfA(buf, "[D3d11Proxy] ApplyVR config: %ls WRITE FAILED (status=%ld)\n",
+                      name, (long)wr);
+        WriteLog(buf);
+    }
+    RegCloseKey(hk);
+
+    char buf[192];
+    wsprintfA(buf, "[D3d11Proxy] ApplyVR config: %d/%d VR settings persisted "
+                   "(reads after this point are enforced in-hooks)\n",
+              okCount, kGameGfxSettingCount);
+    WriteLog(buf);
+}
+
 extern "C" HRESULT WINAPI D3D11CreateDevice(
     void* pAdapter, int DriverType, void* Software, UINT Flags,
     const void* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion,
@@ -1928,6 +2333,7 @@ extern "C" HRESULT WINAPI D3D11CreateDevice(
     }
     ++t_depth;
     LogGameGraphicsConfig();
+    ApplyGameGraphicsConfig();
     char buf[128];
     wchar_t debugFlag[2] = {};
     if (GetEnvironmentVariableW(L"DEUSEXHRVR_D3D_DEBUG", debugFlag, 2) && debugFlag[0] == L'1')
@@ -1982,6 +2388,7 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
     }
     ++t_depth;
     LogGameGraphicsConfig();
+    ApplyGameGraphicsConfig();
     char buf[128];
     wsprintfA(buf, "[D3d11Proxy] D3D11CreateDeviceAndSwapChain(adapter=%p driverType=%d flags=0x%X)\n",
               pAdapter, DriverType, Flags);
