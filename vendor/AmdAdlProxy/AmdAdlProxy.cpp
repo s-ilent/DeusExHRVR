@@ -375,7 +375,19 @@ extern "C" int __cdecl ADL_Display_DisplayMapConfig_Get(int iAdapterIndex,
     pMap->displayMode.iXRes        = screenW;
     pMap->displayMode.iYRes        = screenH;
     pMap->displayMode.iColourDepth = 32;
-    pMap->displayMode.fRefreshRate = 60.0f;
+    // Report the REAL current desktop refresh rate. HD3D activation requires a
+    // >=100 Hz display; the old hardcoded 60.0f made the adapter claim a
+    // stereo-incapable current mode (observed: DXHR enumerates the QB stereo
+    // extension, then destroys it without calling EnableQuadBufferStereo).
+    float refreshHz = 60.0f;
+    DEVMODEW dm = {};
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) &&
+        (dm.dmFields & DM_DISPLAYFREQUENCY) && dm.dmDisplayFrequency > 1)
+    {
+        refreshHz = (float)dm.dmDisplayFrequency;
+    }
+    pMap->displayMode.fRefreshRate = refreshHz;
     pMap->displayMode.iOrientation = 0;
     pMap->iNumDisplayTarget                    = 1;
     pMap->iFirstDisplayTargetArrayIndex        = 0;
@@ -405,8 +417,8 @@ extern "C" int __cdecl ADL_Display_DisplayMapConfig_Get(int iAdapterIndex,
     *lppDisplayTarget   = pTgt;
 
     char logbuf[160];
-    wsprintfA(logbuf, "[AmdAdlProxy] ADL_Display_DisplayMapConfig_Get -> 1 map (%dx%d), 1 target\n",
-              screenW, screenH);
+    wsprintfA(logbuf, "[AmdAdlProxy] ADL_Display_DisplayMapConfig_Get -> 1 map (%dx%d @ %dHz), 1 target\n",
+              screenW, screenH, (int)(refreshHz + 0.5f));
     WriteLog(logbuf);
     return ADL_OK;
 }

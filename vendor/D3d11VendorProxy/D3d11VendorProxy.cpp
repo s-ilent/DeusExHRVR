@@ -1808,6 +1808,87 @@ extern "C" HRESULT WINAPI D3D11CoreRegisterLayers(const void* pLayerDesc, DWORD 
     return fn ? fn(pLayerDesc, NumLayers) : E_NOTIMPL;
 }
 
+// ---- Game graphics-settings diagnostic ------------------------------------
+// DeusExHRVR's installers set HKCU\Software\Eidos\Deus Ex: HRDC\Graphics
+// (EnableDirectX11=1, StereoMode=1, EnableVSync=0, AntiAliasingMode=0).
+// When the game runs without those keys (e.g. DLLs copied in by hand under
+// Proton, installer registry step never applied to the active prefix), it
+// still probes AMD HD3D hardware but never enables quad-buffer stereo and
+// boots flat.  Log the values we actually see so a missing-key install is
+// obvious from HD3D_dxgi.log alone.  Called once, on the first D3D11 device
+// request — outside the DllMain loader lock.
+static void LogGameGraphicsConfig()
+{
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+
+    // Prefer the un-hooked KernelBase trampoline so our own probes don't spam
+    // the hooked-API logging paths.
+    typedef LSTATUS (WINAPI* PFN_RegGetValueW_t)(HKEY, LPCWSTR, LPCWSTR, DWORD,
+                                                 LPDWORD, PVOID, LPDWORD);
+    PFN_RegGetValueW_t getVal = g_pfnRegGetValueW
+        ? reinterpret_cast<PFN_RegGetValueW_t>(g_pfnRegGetValueW)
+        : reinterpret_cast<PFN_RegGetValueW_t>(&RegGetValueW);
+
+    const wchar_t* kKeyPath = L"Software\\Eidos\\Deus Ex: HRDC\\Graphics";
+    struct NamePair { const char* narrow; const wchar_t* wide; };
+    static const NamePair kValues[] = {
+        { "EnableDirectX11",  L"EnableDirectX11"  },
+        { "StereoMode",       L"StereoMode"       },
+        { "EnableVSync",      L"EnableVSync"      },
+        { "AntiAliasingMode", L"AntiAliasingMode" },
+    };
+
+    char buf[160];
+    for (const NamePair& v : kValues)
+    {
+        DWORD data = 0, size = sizeof(data), type = 0;
+        LSTATUS st = getVal(HKEY_CURRENT_USER, kKeyPath, v.wide,
+                            RRF_RT_REG_DWORD, &type, &data, &size);
+        if (st == ERROR_SUCCESS)
+            wsprintfA(buf, "[D3d11Proxy] Game config: %s = %lu\n",
+                      v.narrow, (unsigned long)data);
+        else
+            wsprintfA(buf, "[D3d11Proxy] Game config: %s MISSING (status=%ld) "
+                           "<-- installer registry step not applied to this prefix?\n",
+                      v.narrow, (long)st);
+        WriteLog(buf);
+    }
+
+    // Current desktop mode + the highest refresh available at that resolution.
+    // HD3D activation wants >= 100 Hz at the game resolution; a mismatch
+    // between the desktop and Wine's synthesized mode list is diagnostic.
+    DEVMODEW dm = {};
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm))
+    {
+        wsprintfA(buf, "[D3d11Proxy] Desktop current: %lux%lu @ %luHz bits=%lu\n",
+                  (unsigned long)dm.dmPelsWidth, (unsigned long)dm.dmPelsHeight,
+                  (unsigned long)dm.dmDisplayFrequency,
+                  (unsigned long)dm.dmBitsPerPel);
+        WriteLog(buf);
+    }
+    int totalModes = 0, maxHz = 0;
+    DWORD curW = dm.dmPelsWidth, curH = dm.dmPelsHeight;
+    for (DWORD i = 0; i < 1024; ++i)
+    {
+        dm = {};
+        dm.dmSize = sizeof(dm);
+        if (!EnumDisplaySettingsW(nullptr, i, &dm)) break;
+        ++totalModes;
+        if (dm.dmPelsWidth == curW && dm.dmPelsHeight == curH &&
+            (dm.dmFields & DM_DISPLAYFREQUENCY))
+        {
+            int hz = (int)dm.dmDisplayFrequency;
+            if (hz > maxHz) maxHz = hz;
+        }
+    }
+    wsprintfA(buf, "[D3d11Proxy] Desktop modes: total=%d maxRefresh@%lux%lu=%dHz\n",
+              totalModes, (unsigned long)curW, (unsigned long)curH, maxHz);
+    WriteLog(buf);
+}
+
 extern "C" HRESULT WINAPI D3D11CreateDevice(
     void* pAdapter, int DriverType, void* Software, UINT Flags,
     const void* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion,
@@ -1846,6 +1927,7 @@ extern "C" HRESULT WINAPI D3D11CreateDevice(
         return hr2;
     }
     ++t_depth;
+    LogGameGraphicsConfig();
     char buf[128];
     wchar_t debugFlag[2] = {};
     if (GetEnvironmentVariableW(L"DEUSEXHRVR_D3D_DEBUG", debugFlag, 2) && debugFlag[0] == L'1')
@@ -1899,6 +1981,7 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
         return hr2;
     }
     ++t_depth;
+    LogGameGraphicsConfig();
     char buf[128];
     wsprintfA(buf, "[D3d11Proxy] D3D11CreateDeviceAndSwapChain(adapter=%p driverType=%d flags=0x%X)\n",
               pAdapter, DriverType, Flags);
