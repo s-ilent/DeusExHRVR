@@ -2,20 +2,29 @@
 
 Tracked here because GitHub Issues are disabled on this repo.
 
-## 1. Phase 3e: SMAA draw passes
+## 1. Phase 3e: SMAA draw passes — WON'T DO (incompatible with VR config)
 
-**Status:** Phase 3 stubs SMAA. Trigger detection is wired (MLAA-mask hash
-`0x6B0219A1`, SupportedAA hashes), `Luma_SMAA_Linearize` CS compiles, but the
-3 draw passes (edge detection → blending weight calculation → neighborhood
-blending) are not implemented. `RunSMAA` returns false.
+**Status:** Not implementable under DXHRVR's required configuration.
 
-**Task:** Port Luma's `DrawSMAA` (main.cpp ~line 648 callsite + the helper).
-Needs the SMAA area/search textures (Luma ships them as `SMAA_AreaTex.h` /
-`SMAA_SearchTex.h` byte arrays in `Source/Core/texture_data/`). Requires 6
-SMAA VS+PS shaders compiled from `Luma_SMAA_impl.hlsl`.
+**Rationale:** The VR mod requires `AntiAliasingMode=0` (set by the installer,
+confirmed in README) because the game's built-in AA conflicts with the native
+stereo renderer's double-height buffer. Luma's SMAA replaces the game's MLAA,
+which is itself an AA pass — so when `AntiAliasingMode=0`, the MLAA-mask draw
+(`0x6B0219A1`, the SMAA trigger) doesn't fire. Even if it did, running SMAA on
+the double-height stereo buffer would AA across the eye seam. The same applies
+to Luma's FXAA replacement (`0xFF6E347A`).
 
-**Files:** `src/LumaPasses.cpp` (`RunSMAA`), `tools/compile_shaders.ps1`
-(compile the 6 SMAA shader variants), `shaders/dxhr/Luma_SMAA_impl.hlsl`.
+Luma's SMAA was designed for the mono desktop pipeline (one eye, AA on).
+Neither holds in DXHRVR.
+
+**Alternative paths for VR AA** (not Luma ports, separate DXHRVR features):
+- Engine-level MSAA on the stereo render targets (would need DXHRVR support)
+- Post-composition AA on the final OpenXR swapchain in the 64-bit host
+
+**Action:** `RunSMAA` stays a stub returning false. The SMAA trigger detection
+in `LumaPasses::OnDraw` is left in place (harmless — it logs but does nothing).
+The `Luma_SMAA_Linearize` CS and `Luma_SMAA_impl.hlsl` are kept in the shader
+tree in case a future DXHRVR config allows AA.
 
 ## 2. Phase 4: overlap dedup with DXHRVR stereo corrections — DONE
 
