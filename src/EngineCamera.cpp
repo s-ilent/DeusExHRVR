@@ -7,6 +7,8 @@
 #include "EffectShader.h"
 #include "ShaderSwap.h"
 #include "LumaPasses.h"
+#include "LumaSettingsCB.h"
+#include "DisplaySettings.h"
 #include "ScreenMode.h"
 #include <windows.h>
 #include <MinHook.h>
@@ -363,6 +365,7 @@ void __fastcall VideoDestroyHook(void* self,void*) {screenMode.Remove(self);orig
 EffectShader effectShaders;
 ShaderSwap shaderSwap; // Luma fix port: hash-keyed native shader swap (sidesteps ReShade)
 LumaPasses lumaPasses; // Luma fix port: per-eye injected passes (XeGTAO/SMAA/ModulateLighting)
+LumaSettingsCB::Manager lumaSettingsCB; // Luma fix port: LumaSettings cbuffer (b13)
 uint64_t instanceCorrections{};
 void __fastcall RenderStateHook(void* self,void*) {
     auto state=static_cast<unsigned char*>(self);
@@ -419,7 +422,8 @@ void __fastcall RenderStateHook(void* self,void*) {
     // Runs per-draw on the render thread; TrySubstitutePS is a no-op when
     // disabled or when no replacement exists for this hash.
     if(lumaHash && shaderSwap.SubstitutionEnabled())
-        shaderSwap.TrySubstitutePS(lumaHash);
+        shaderSwap.TrySubstitutePS(lumaHash,
+            EffectShader::UsesCentreViewMatrix(shader));
     // Luma port Phase 3: injected passes (XeGTAO/SMAA/ModulateLighting).
     // Evaluate triggers against the bound PS hash; OnDraw is a no-op unless a
     // trigger matches and the pass is enabled. Per-eye is automatic: the hook
@@ -780,6 +784,34 @@ void Install() {
         lumaPasses.SetXeGTAOEnabled(GetPrivateProfileIntW(L"Luma",L"XeGTAOEnable",0,config)!=0);
         lumaPasses.SetSMAAEnabled(GetPrivateProfileIntW(L"Luma",L"SMAAEnable",0,config)!=0);
         lumaPasses.SetModulateLightingEnabled(GetPrivateProfileIntW(L"Luma",L"ModulateLightingEnable",0,config)!=0);
+        // LumaSettings cbuffer values. Defaults match Luma's DXHR main.cpp
+        // (lines 1589-1599): "not vanilla like" tuned values. Override via ini.
+        // These take effect on the next Bind() (lumaSettingsCB is init'd later
+        // in SetShaderSwapDevice, but setting values now is fine — SetDefaults
+        // runs first, then these override before any bind happens).
+        auto readFloat=[&](const wchar_t* key,float def)->float{
+            wchar_t buf[32];GetPrivateProfileStringW(L"Luma",key,nullptr,buf,32,config);
+            float v=_wtof(buf);return std::isfinite(v)?v:def;
+        };
+        auto& gs=lumaSettingsCB.Get().GameSettings;
+        gs.BloomIntensity=readFloat(L"BloomIntensity",0.8f);
+        gs.FogIntensity=readFloat(L"FogIntensity",0.0f);
+        gs.ColorGradingIntensity=readFloat(L"ColorGradingIntensity",1.0f);
+        gs.DesaturationIntensity=readFloat(L"DesaturationIntensity",0.333f);
+        gs.AmbientLightingIntensity=readFloat(L"AmbientLightingIntensity",0.8f);
+        gs.EmissiveIntensity=readFloat(L"EmissiveIntensity",0.667f);
+        gs.HDRBoostIntensity=readFloat(L"HDRBoostIntensity",1.0f);
+        lumaSettingsCB.MarkDirty();
+        // Phase 4: overlap dedup. Default on — skip Luma substitution for
+        // shaders DXHRVR already corrects per-eye (projected light/shadow via
+        // F3, identified by EffectShader::UsesCentreViewMatrix).
+        shaderSwap.SetDedupWithDXHRVR(GetPrivateProfileIntW(L"Luma",L"DedupWithDXHRVR",1,config)!=0);
+        // When XeGTAO is enabled, skip Luma's SSAO generation replacement
+        // (XeGTAO overwrites the result, so the substitution is wasted work).
+        if(GetPrivateProfileIntW(L"Luma",L"XeGTAOEnable",0,config)!=0) {
+            shaderSwap.AddSkipHash(0xD44718C4u); // GenerateAmbientOcclusion (DC)
+            shaderSwap.AddSkipHash(0x7A054979u); // GenerateAmbientOcclusion (OG)
+        }
     }
     FILE* f{};if(!fopen_s(&f,"DeusExHRVR-camera.log","a")) {
         fprintf(f,"Camera hooks base=%p enabled=%d unitsPerMetre=%g lockVerticalCamera=%d F6=toggle F9=recenter\n",reinterpret_cast<void*>(base),enabled,worldScale,lockVerticalCamera);fclose(f);
@@ -792,6 +824,19 @@ Transport::RenderInfo OnPresent(uint64_t frame,bool capture) {
     // Luma port: reset per-frame scheduling flags at frame start (mirrors
     // Luma resetting game_device_data on frame boundary).
     if(lumaPasses.Loaded()) lumaPasses.OnFrameStart();
+    // Luma port: update LumaSettings per-frame (frame index + resolution).
+    // Resolution comes from HeadsetDisplay (queried at startup). Luma's
+    // main.cpp does this at line 528-529.
+    if(lumaSettingsCB.Initialized()) {
+        lumaSettingsCB.SetFrameIndex(static_cast<uint32_t>(frame));
+        // Use headset eye resolution as the output resolution (each eye is
+        // rendered at this size). HeadsetDisplay::Active() + Settings hold it.
+        if(HeadsetDisplay::Active()) {
+            auto s=HeadsetDisplay::GetSettings();
+            lumaSettingsCB.SetOutputResolution(static_cast<float>(s.width),
+                                               static_cast<float>(s.height));
+        }
+    }
     // Detailed camera dumps perform synchronous file IO. Never schedule them
     // periodically on the render thread; F8 is the explicit diagnostic request.
     budget=capture?32:0;
@@ -889,6 +934,13 @@ void SetShaderSwapDevice(ID3D11Device* device){
             std::filesystem::path compiled=std::filesystem::path(module)/L"DeusExHRVR"/L"shaders"/L"dxhr"/L"compiled";
             lumaPasses.Load(compiled, device);
         }
+        // LumaSettings cbuffer: init + set defaults + cross-link so both
+        // ShaderSwap (Phase 2) and LumaPasses (Phase 3) can bind it at b13
+        // before their shaders run.
+        lumaSettingsCB.Init(device);
+        lumaSettingsCB.SetDefaults();
+        shaderSwap.SetLumaSettingsCB(&lumaSettingsCB);
+        lumaPasses.SetLumaSettingsCB(&lumaSettingsCB);
     }
 }
 bool ToggleShaderSubstitution(){bool on=!shaderSwap.SubstitutionEnabled();shaderSwap.SetSubstitutionEnabled(on);return on;}
