@@ -1,7 +1,7 @@
 name: build-probe
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, vulkan-probe]
   workflow_dispatch:
 
 jobs:
