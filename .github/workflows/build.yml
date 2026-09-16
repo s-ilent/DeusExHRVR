@@ -9,16 +9,16 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch Vulkan headers
+      - name: Fetch Vulkan headers (from repo tarball)
         shell: pwsh
         run: |
-          $url = "https://github.com/KhronosGroup/Vulkan-Headers/releases/download/v1.4.313.0/Vulkan-Headers-1.4.313.0.zip"
-          Write-Host "Downloading Vulkan-Headers..."
-          Invoke-WebRequest -Uri $url -OutFile headers.zip -TimeoutSec 120
-          Expand-Archive -Path headers.zip -DestinationPath C:\VKHeaders -Force
-          $dir = Get-ChildItem C:\VKHeaders -Directory | Select-Object -First 1
-          Write-Host "Headers at: $($dir.FullName)\include"
-          echo "VK_INCLUDE=$($dir.FullName)\include" >> $env:GITHUB_ENV
+          $url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.313.0.tar.gz"
+          Write-Host "Downloading..."
+          Invoke-WebRequest -Uri $url -OutFile vk.tar.gz -TimeoutSec 120
+          tar xzf vk.tar.gz
+          $dir = "Vulkan-Headers-1.4.313.0"
+          echo "VK_INCLUDE=$PWD\$dir\include" >> $env:GITHUB_ENV
+          Write-Host "Headers at: $PWD\$dir\include"
       - name: Set up MSVC (x86)
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -26,7 +26,7 @@ jobs:
       - name: Configure + build (32-bit)
         shell: pwsh
         run: |
-          cmake -S . -B build -A Win32 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="/I$env:VK_INCLUDE"
+          cmake -S . -B build -A Win32 -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CXX_FLAGS=/I`"$env:VK_INCLUDE`""
           cmake --build build --config Release
       - name: Upload probe
         uses: actions/upload-artifact@v4
