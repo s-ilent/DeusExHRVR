@@ -9,13 +9,28 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          $sdk = "https://sdk.lunarg.com/sdk/download/1.3.296.0/windows/VulkanSDK-1.3.296.0-Installer.exe"
+          Write-Host "Downloading Vulkan SDK..."
+          Invoke-WebRequest -Uri $sdk -OutFile vulkan-sdk.exe
+          Write-Host "Installing silently..."
+          Start-Process -FilePath vulkan-sdk.exe -ArgumentList "--accept-licenses --default --root C:\VulkanSDK" -Wait -NoNewWindow
+          echo "VULKAN_SDK=C:\VulkanSDK" >> $env:GITHUB_ENV
+          echo "C:\VulkanSDK\Include" >> $env:GITHUB_PATH
+          echo "C:\VulkanSDK\Lib32" >> $env:GITHUB_PATH
       - name: Set up MSVC (x86)
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x86
       - name: Configure + build (32-bit)
+        shell: pwsh
+        env:
+          VULKAN_SDK: C:\VulkanSDK
         run: |
-          cmake -S . -B build -A Win32 -DCMAKE_BUILD_TYPE=Release
+          $env:VULKAN_SDK = "C:\VulkanSDK"
+          cmake -S . -B build -A Win32 -DCMAKE_BUILD_TYPE=Release -DVULKAN_SDK="C:\VulkanSDK"
           cmake --build build --config Release
       - name: Upload probe
         uses: actions/upload-artifact@v4
