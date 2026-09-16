@@ -1,5 +1,7 @@
 // Vulkan device-creation diagnostic probe (32-bit x86).
-// Loads vulkan-1.dll at runtime (VK_NO_PROTOTYPES) — no SDK lib needed.
+// Loads vulkan-1.dll at runtime. Global functions (vkCreateInstance etc.)
+// are obtained via vkGetInstanceProcAddr(NULL, name) — NOT GetProcAddress,
+// because vulkan-1.dll only exports vkGetInstanceProcAddr + the enum funcs.
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR 1
 #include <vulkan/vulkan.h>
@@ -9,29 +11,25 @@
 #include <vector>
 #include <string>
 
-// Function pointer types
-#define VK_DECLARE(name) PFN_##name name = nullptr
-VK_DECLARE(vkCreateInstance);
-VK_DECLARE(vkEnumerateInstanceExtensionProperties);
-VK_DECLARE(vkEnumeratePhysicalDevices);
-VK_DECLARE(vkGetPhysicalDeviceProperties);
-VK_DECLARE(vkEnumerateDeviceExtensionProperties);
-VK_DECLARE(vkGetPhysicalDeviceQueueFamilyProperties);
-VK_DECLARE(vkCreateDevice);
-VK_DECLARE(vkDestroyDevice);
-VK_DECLARE(vkDestroyInstance);
-PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
+// Function pointers
+static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
+static PFN_vkEnumerateInstanceExtensionProperties vkEnumerateInstanceExtensionProperties = nullptr;
+static PFN_vkCreateInstance vkCreateInstance = nullptr;
+static PFN_vkEnumeratePhysicalDevices vkEnumeratePhysicalDevices = nullptr;
+static PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties = nullptr;
+static PFN_vkEnumerateDeviceExtensionProperties vkEnumerateDeviceExtensionProperties = nullptr;
+static PFN_vkGetPhysicalDeviceQueueFamilyProperties vkGetPhysicalDeviceQueueFamilyProperties = nullptr;
+static PFN_vkCreateDevice vkCreateDevice = nullptr;
+static PFN_vkDestroyDevice vkDestroyDevice = nullptr;
+static PFN_vkDestroyInstance vkDestroyInstance = nullptr;
 
-#define VK_LOAD_INST(name) name = (PFN_##name)vkGetInstanceProcAddr(inst, #name)
-#define VK_LOAD_GLOBAL(name) name = (PFN_##name)GetProcAddress(g_vulkan, #name)
-
-static HMODULE g_vulkan = nullptr;
 static FILE* g_log = nullptr;
 
 static void Log(const char* fmt, ...) {
     va_list a; va_start(a, fmt);
     vfprintf(g_log, fmt, a);
     vprintf(fmt, a);
+    fflush(g_log);
     va_end(a);
 }
 
@@ -40,13 +38,28 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     if (!g_log) g_log = stdout;
     Log("=== Vulkan Device Creation Probe (32-bit) ===\n\n");
 
-    // Load vulkan-1.dll
-    g_vulkan = LoadLibraryA("vulkan-1.dll");
-    if (!g_vulkan) { Log("Failed to load vulkan-1.dll (err=%lu)\n", GetLastError()); return 1; }
-    Log("Loaded vulkan-1.dll at %p\n", g_vulkan);
+    // Load vulkan-1.dll (the Vulkan loader)
+    HMODULE vulkanDll = LoadLibraryA("vulkan-1.dll");
+    if (!vulkanDll) { Log("Failed to load vulkan-1.dll (err=%lu)\n", GetLastError()); return 1; }
+    Log("Loaded vulkan-1.dll at %p\n", vulkanDll);
 
-    VK_LOAD_GLOBAL(vkGetInstanceProcAddr);
-    if (!vkGetInstanceProcAddr) { Log("vkGetInstanceProcAddr not found\n"); return 1; }
+    // vkGetInstanceProcAddr IS exported by vulkan-1.dll
+    vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)GetProcAddress(vulkanDll, "vkGetInstanceProcAddr");
+    if (!vkGetInstanceProcAddr) { Log("vkGetInstanceProcAddr not found in vulkan-1.dll\n"); return 1; }
+    Log("vkGetInstanceProcAddr = %p\n", vkGetInstanceProcAddr);
+
+    // vkEnumerateInstanceExtensionProperties is also exported directly
+    vkEnumerateInstanceExtensionProperties = (PFN_vkEnumerateInstanceExtensionProperties)GetProcAddress(vulkanDll, "vkEnumerateInstanceExtensionProperties");
+    if (!vkEnumerateInstanceExtensionProperties) {
+        // Try via vkGetInstanceProcAddr with null instance
+        vkEnumerateInstanceExtensionProperties = (PFN_vkEnumerateInstanceExtensionProperties)vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
+    }
+    Log("vkEnumerateInstanceExtensionProperties = %p\n", vkEnumerateInstanceExtensionProperties);
+
+    // Load global-level functions via vkGetInstanceProcAddr(NULL, name)
+    vkCreateInstance = (PFN_vkCreateInstance)vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
+    Log("vkCreateInstance = %p\n", vkCreateInstance);
+    if (!vkCreateInstance) { Log("FAILED to load vkCreateInstance\n"); return 1; }
 
     // 1. Create instance
     VkInstanceCreateInfo ici = {};
@@ -65,18 +78,20 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     ici.ppEnabledExtensionNames = instExts;
 
     VkInstance inst = VK_NULL_HANDLE;
+    Log("Calling vkCreateInstance...\n");
     VkResult r = vkCreateInstance(&ici, nullptr, &inst);
     Log("vkCreateInstance: %d (%s)\n", r, r == VK_SUCCESS ? "OK" : "FAILED");
-    if (r != VK_SUCCESS) { fclose(g_log); return 1; }
+    if (r != VK_SUCCESS) { Log("Cannot continue without instance.\n"); fclose(g_log); return 1; }
 
-    // Load instance functions
-    VK_LOAD_INST(vkEnumeratePhysicalDevices);
-    VK_LOAD_INST(vkGetPhysicalDeviceProperties);
-    VK_LOAD_INST(vkEnumerateDeviceExtensionProperties);
-    VK_LOAD_INST(vkGetPhysicalDeviceQueueFamilyProperties);
-    VK_LOAD_INST(vkCreateDevice);
-    VK_LOAD_INST(vkDestroyDevice);
-    VK_LOAD_INST(vkDestroyInstance);
+    // Load instance-level functions
+    vkEnumeratePhysicalDevices = (PFN_vkEnumeratePhysicalDevices)vkGetInstanceProcAddr(inst, "vkEnumeratePhysicalDevices");
+    vkGetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceProperties");
+    vkEnumerateDeviceExtensionProperties = (PFN_vkEnumerateDeviceExtensionProperties)vkGetInstanceProcAddr(inst, "vkEnumerateDeviceExtensionProperties");
+    vkGetPhysicalDeviceQueueFamilyProperties = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceQueueFamilyProperties");
+    vkCreateDevice = (PFN_vkCreateDevice)vkGetInstanceProcAddr(inst, "vkCreateDevice");
+    vkDestroyDevice = (PFN_vkDestroyDevice)vkGetInstanceProcAddr(inst, "vkDestroyDevice");
+    vkDestroyInstance = (PFN_vkDestroyInstance)vkGetInstanceProcAddr(inst, "vkDestroyInstance");
+    Log("Instance functions loaded (vkCreateDevice=%p)\n", vkCreateDevice);
 
     // 2. Enumerate physical devices
     uint32_t gpuCount = 0;
