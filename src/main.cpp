@@ -1,15 +1,33 @@
-// Vulkan device-creation diagnostic probe.
-// Builds as 32-bit (x86) to match DXHRDC.exe's environment.
-// Tries vkCreateDevice with incrementally larger extension sets and reports
-// exactly which extension causes VK_ERROR_EXTENSION_NOT_PRESENT.
+// Vulkan device-creation diagnostic probe (32-bit x86).
+// Loads vulkan-1.dll at runtime (VK_NO_PROTOTYPES) — no SDK lib needed.
+#define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR 1
 #include <vulkan/vulkan.h>
+#include <windows.h>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 #include <string>
 
+// Function pointer types
+#define VK_DECLARE(name) PFN_##name name = nullptr
+VK_DECLARE(vkCreateInstance);
+VK_DECLARE(vkEnumerateInstanceExtensionProperties);
+VK_DECLARE(vkEnumeratePhysicalDevices);
+VK_DECLARE(vkGetPhysicalDeviceProperties);
+VK_DECLARE(vkEnumerateDeviceExtensionProperties);
+VK_DECLARE(vkGetPhysicalDeviceQueueFamilyProperties);
+VK_DECLARE(vkCreateDevice);
+VK_DECLARE(vkDestroyDevice);
+VK_DECLARE(vkDestroyInstance);
+PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
+
+#define VK_LOAD_INST(name) name = (PFN_##name)vkGetInstanceProcAddr(inst, #name)
+#define VK_LOAD_GLOBAL(name) name = (PFN_##name)GetProcAddress(g_vulkan, #name)
+
+static HMODULE g_vulkan = nullptr;
 static FILE* g_log = nullptr;
+
 static void Log(const char* fmt, ...) {
     va_list a; va_start(a, fmt);
     vfprintf(g_log, fmt, a);
@@ -22,10 +40,17 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     if (!g_log) g_log = stdout;
     Log("=== Vulkan Device Creation Probe (32-bit) ===\n\n");
 
-    // 1. Create instance with minimal extensions
+    // Load vulkan-1.dll
+    g_vulkan = LoadLibraryA("vulkan-1.dll");
+    if (!g_vulkan) { Log("Failed to load vulkan-1.dll (err=%lu)\n", GetLastError()); return 1; }
+    Log("Loaded vulkan-1.dll at %p\n", g_vulkan);
+
+    VK_LOAD_GLOBAL(vkGetInstanceProcAddr);
+    if (!vkGetInstanceProcAddr) { Log("vkGetInstanceProcAddr not found\n"); return 1; }
+
+    // 1. Create instance
     VkInstanceCreateInfo ici = {};
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    // Enable the same instance extensions DXVK uses
     const char* instExts[] = {
         VK_KHR_SURFACE_EXTENSION_NAME,
         VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
@@ -34,7 +59,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
         VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
         VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME,
-        VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
+        "VK_KHR_surface_maintenance1",
     };
     ici.enabledExtensionCount = 8;
     ici.ppEnabledExtensionNames = instExts;
@@ -43,6 +68,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     VkResult r = vkCreateInstance(&ici, nullptr, &inst);
     Log("vkCreateInstance: %d (%s)\n", r, r == VK_SUCCESS ? "OK" : "FAILED");
     if (r != VK_SUCCESS) { fclose(g_log); return 1; }
+
+    // Load instance functions
+    VK_LOAD_INST(vkEnumeratePhysicalDevices);
+    VK_LOAD_INST(vkGetPhysicalDeviceProperties);
+    VK_LOAD_INST(vkEnumerateDeviceExtensionProperties);
+    VK_LOAD_INST(vkGetPhysicalDeviceQueueFamilyProperties);
+    VK_LOAD_INST(vkCreateDevice);
+    VK_LOAD_INST(vkDestroyDevice);
+    VK_LOAD_INST(vkDestroyInstance);
 
     // 2. Enumerate physical devices
     uint32_t gpuCount = 0;
@@ -54,16 +88,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     for (uint32_t g = 0; g < gpuCount; g++) {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(gpus[g], &props);
-        Log("  [%u] %s (driver %u.%u.%u, api %u.%u.%u)\n",
-            g, props.deviceName,
-            VK_VERSION_MAJOR(props.driverVersion), VK_VERSION_MINOR(props.driverVersion), VK_VERSION_PATCH(props.driverVersion),
+        Log("  [%u] %s (driver 0x%x, api %u.%u.%u)\n",
+            g, props.deviceName, props.driverVersion,
             VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion), VK_VERSION_PATCH(props.apiVersion));
     }
 
-    // Use device 0
     VkPhysicalDevice phys = gpus[0];
 
-    // 3. Enumerate ALL device extensions — the ground truth
+    // 3. Enumerate ALL device extensions
     uint32_t extCount = 0;
     vkEnumerateDeviceExtensionProperties(phys, nullptr, &extCount, nullptr);
     std::vector<VkExtensionProperties> exts(extCount);
@@ -71,62 +103,39 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     Log("\nDevice reports %u extensions supported:\n", extCount);
     std::vector<std::string> allExtNames;
     for (auto& e : exts) {
-        Log("  %s (spec %u.%u.%u)\n", e.extensionName,
-            VK_VERSION_MAJOR(e.specVersion), VK_VERSION_MINOR(e.specVersion), VK_VERSION_PATCH(e.specVersion));
+        Log("  %s\n", e.extensionName);
         allExtNames.push_back(e.extensionName);
     }
 
-    // 4. The FULL set DXVK 3.1 requests (from the game's log)
+    // 4. The FULL set DXVK 3.1 requests
     const char* dxvkFullSet[] = {
-        VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,
-        VK_EXT_BORDER_COLOR_SWIZZLE_EXTENSION_NAME,
-        VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME,
-        VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME,
-        VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
-        "VK_EXT_depth_bias_control",
-        "VK_EXT_descriptor_heap",
-        "VK_EXT_dynamic_rendering_unused_attachments",
-        VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME,
-        VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME,
-        VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME,
-        VK_EXT_HDR_METADATA_EXTENSION_NAME,
-        VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME,
-        VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME,
-        VK_EXT_MULTI_DRAW_EXTENSION_NAME,
-        VK_EXT_NON_SEAMLESS_CUBE_MAP_EXTENSION_NAME,
-        VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME,
-        VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
-        VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME,
-        VK_EXT_SHADER_MODULE_IDENTIFIER_EXTENSION_NAME,
-        VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME,
-        VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME,
-        "VK_KHR_dynamic_rendering_local_read",
-        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
-        VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
-        VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME,
-        VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME,
-        VK_KHR_MAINTENANCE_5_EXTENSION_NAME,
-        VK_KHR_MAINTENANCE_6_EXTENSION_NAME,
-        "VK_KHR_maintenance8",
-        "VK_KHR_maintenance9",
-        "VK_KHR_maintenance10",
-        "VK_KHR_maintenance11",
-        VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME,
-        VK_KHR_PRESENT_ID_EXTENSION_NAME,
-        VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
-        "VK_KHR_shader_float_controls2",
-        "VK_KHR_shader_subgroup_uniform_control_flow",
-        "VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME,
-        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-        "VK_KHR_swapchain_maintenance1",
-        "VK_KHR_swapchain_mutable_format",
-        "VK_KHR_unified_image_layouts",
-        VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME,
+        "VK_EXT_attachment_feedback_loop_layout","VK_EXT_border_color_swizzle",
+        "VK_EXT_conservative_rasterization","VK_EXT_custom_border_color",
+        "VK_EXT_depth_clip_enable","VK_EXT_depth_bias_control",
+        "VK_EXT_descriptor_heap","VK_EXT_dynamic_rendering_unused_attachments",
+        "VK_EXT_extended_dynamic_state3","VK_EXT_fragment_shader_interlock",
+        "VK_EXT_graphics_pipeline_library","VK_EXT_hdr_metadata",
+        "VK_EXT_line_rasterization","VK_EXT_memory_priority",
+        "VK_EXT_multi_draw","VK_EXT_non_seamless_cube_map",
+        "VK_EXT_pageable_device_local_memory","VK_EXT_robustness2",
+        "VK_EXT_sample_locations","VK_EXT_shader_module_identifier",
+        "VK_EXT_transform_feedback","VK_EXT_vertex_attribute_divisor",
+        "VK_KHR_dynamic_rendering_local_read","VK_KHR_external_memory_win32",
+        "VK_KHR_external_semaphore_win32","VK_KHR_incremental_present",
+        "VK_KHR_load_store_op_none","VK_KHR_maintenance5",
+        "VK_KHR_maintenance6","VK_KHR_maintenance8",
+        "VK_KHR_maintenance9","VK_KHR_maintenance10",
+        "VK_KHR_maintenance11","VK_KHR_pipeline_library",
+        "VK_KHR_present_id","VK_KHR_present_wait",
+        "VK_KHR_shader_float_controls2","VK_KHR_shader_subgroup_uniform_control_flow",
+        "VK_KHR_shader_untyped_pointers","VK_KHR_swapchain",
+        "VK_KHR_swapchain_maintenance1","VK_KHR_swapchain_mutable_format",
+        "VK_KHR_unified_image_layouts","VK_KHR_win32_keyed_mutex",
         "VK_NV_raw_access_chains",
     };
     const size_t fullCount = sizeof(dxvkFullSet)/sizeof(dxvkFullSet[0]);
 
-    // 5. Find a graphics queue family
+    // 5. Find graphics queue
     uint32_t qfCount = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(phys, &qfCount, nullptr);
     std::vector<VkQueueFamilyProperties> qfs(qfCount);
@@ -138,134 +147,85 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     Log("\nGraphics queue family: %u\n", graphicsQf);
     if (graphicsQf == 0xFFFFFFFF) { Log("NO GRAPHICS QUEUE!\n"); fclose(g_log); return 1; }
 
-    // 6. EXPERIMENT 1: Try the full DXVK set
-    Log("\n--- EXPERIMENT 1: Full DXVK 3.1 extension set (%zu exts) ---\n", fullCount);
+    // EXPERIMENT 1: Full DXVK set
+    Log("\n--- EXPERIMENT 1: Full DXVK 3.1 set (%zu exts) ---\n", fullCount);
     {
         float prio = 1.0f;
-        VkDeviceQueueCreateInfo qci = {};
-        qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        qci.queueFamilyIndex = graphicsQf;
-        qci.queueCount = 1;
-        qci.pQueuePriorities = &prio;
-
-        VkDeviceCreateInfo dci = {};
-        dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        dci.queueCreateInfoCount = 1;
-        dci.pQueueCreateInfos = &qci;
-        dci.enabledExtensionCount = (uint32_t)fullCount;
-        dci.ppEnabledExtensionNames = dxvkFullSet;
-
+        VkDeviceQueueCreateInfo qci = {}; qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        qci.queueFamilyIndex = graphicsQf; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+        VkDeviceCreateInfo dci = {}; dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+        dci.enabledExtensionCount = (uint32_t)fullCount; dci.ppEnabledExtensionNames = dxvkFullSet;
         VkDevice dev = VK_NULL_HANDLE;
         r = vkCreateDevice(phys, &dci, nullptr, &dev);
         Log("Result: %d (%s)\n", r, r == VK_SUCCESS ? "SUCCESS" : "FAILED");
         if (dev) vkDestroyDevice(dev, nullptr);
     }
 
-    // 7. EXPERIMENT 2: Binary search — add extensions one at a time
-    Log("\n--- EXPERIMENT 2: Incremental (add one ext at a time) ---\n");
+    // EXPERIMENT 2: Incremental (add one at a time)
+    Log("\n--- EXPERIMENT 2: Incremental ---\n");
     for (size_t i = 0; i < fullCount; i++) {
         float prio = 1.0f;
-        VkDeviceQueueCreateInfo qci = {};
-        qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        qci.queueFamilyIndex = graphicsQf;
-        qci.queueCount = 1;
-        qci.pQueuePriorities = &prio;
-
-        VkDeviceCreateInfo dci = {};
-        dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        dci.queueCreateInfoCount = 1;
-        dci.pQueueCreateInfos = &qci;
-        dci.enabledExtensionCount = (uint32_t)(i + 1);
-        dci.ppEnabledExtensionNames = dxvkFullSet;
-
+        VkDeviceQueueCreateInfo qci = {}; qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        qci.queueFamilyIndex = graphicsQf; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+        VkDeviceCreateInfo dci = {}; dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+        dci.enabledExtensionCount = (uint32_t)(i+1); dci.ppEnabledExtensionNames = dxvkFullSet;
         VkDevice dev = VK_NULL_HANDLE;
         r = vkCreateDevice(phys, &dci, nullptr, &dev);
         if (dev) vkDestroyDevice(dev, nullptr);
-        if (r != VK_SUCCESS) {
-            Log("  FAILED at ext %zu: %s -> error %d\n", i, dxvkFullSet[i], r);
-            break;
-        } else {
-            Log("  OK through ext %zu: %s\n", i, dxvkFullSet[i]);
-        }
+        if (r != VK_SUCCESS) { Log("  FAILED at ext %zu: %s -> %d\n", i, dxvkFullSet[i], r); break; }
+        Log("  OK through %zu: %s\n", i, dxvkFullSet[i]);
     }
 
-    // 8. EXPERIMENT 3: Try each extension individually
+    // EXPERIMENT 3: Each extension individually
     Log("\n--- EXPERIMENT 3: Each extension individually ---\n");
     for (size_t i = 0; i < fullCount; i++) {
         float prio = 1.0f;
-        VkDeviceQueueCreateInfo qci = {};
-        qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        qci.queueFamilyIndex = graphicsQf;
-        qci.queueCount = 1;
-        qci.pQueuePriorities = &prio;
-
-        VkDeviceCreateInfo dci = {};
-        dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        dci.queueCreateInfoCount = 1;
-        dci.pQueueCreateInfos = &qci;
-        dci.enabledExtensionCount = 1;
-        dci.ppEnabledExtensionNames = &dxvkFullSet[i];
-
+        VkDeviceQueueCreateInfo qci = {}; qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        qci.queueFamilyIndex = graphicsQf; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+        VkDeviceCreateInfo dci = {}; dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+        dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &dxvkFullSet[i];
         VkDevice dev = VK_NULL_HANDLE;
         r = vkCreateDevice(phys, &dci, nullptr, &dev);
         if (dev) vkDestroyDevice(dev, nullptr);
-        if (r != VK_SUCCESS) {
-            Log("  INDIVIDUAL FAIL: %s -> error %d\n", dxvkFullSet[i], r);
-        }
+        if (r != VK_SUCCESS) Log("  INDIVIDUAL FAIL: %s -> %d\n", dxvkFullSet[i], r);
     }
 
-    // 9. EXPERIMENT 4: Empty extension set (just swapchain)
+    // EXPERIMENT 4: Minimal (swapchain only)
     Log("\n--- EXPERIMENT 4: Minimal (swapchain only) ---\n");
     {
         float prio = 1.0f;
-        VkDeviceQueueCreateInfo qci = {};
-        qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        qci.queueFamilyIndex = graphicsQf;
-        qci.queueCount = 1;
-        qci.pQueuePriorities = &prio;
-
-        VkDeviceCreateInfo dci = {};
-        dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        dci.queueCreateInfoCount = 1;
-        dci.pQueueCreateInfos = &qci;
-        const char* minimal[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
-        dci.enabledExtensionCount = 1;
-        dci.ppEnabledExtensionNames = minimal;
-
+        VkDeviceQueueCreateInfo qci = {}; qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        qci.queueFamilyIndex = graphicsQf; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+        VkDeviceCreateInfo dci = {}; dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+        const char* minimal[] = { "VK_KHR_swapchain" };
+        dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = minimal;
         VkDevice dev = VK_NULL_HANDLE;
         r = vkCreateDevice(phys, &dci, nullptr, &dev);
         Log("Result: %d (%s)\n", r, r == VK_SUCCESS ? "SUCCESS" : "FAILED");
         if (dev) vkDestroyDevice(dev, nullptr);
     }
 
-    // 10. EXPERIMENT 5: Check if enumeration reports an ext that's NOT actually
-    //     creatable. Compare enumerate vs create for each ext.
+    // EXPERIMENT 5: Enumerate vs Create discrepancy (all exts)
     Log("\n--- EXPERIMENT 5: Enumerate vs Create discrepancy ---\n");
-    Log("Checking if any extension is reported as supported but fails to create...\n");
+    int discrepancyCount = 0;
     for (auto& name : allExtNames) {
         float prio = 1.0f;
-        VkDeviceQueueCreateInfo qci = {};
-        qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        qci.queueFamilyIndex = graphicsQf;
-        qci.queueCount = 1;
-        qci.pQueuePriorities = &prio;
-
-        VkDeviceCreateInfo dci = {};
-        dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        dci.queueCreateInfoCount = 1;
-        dci.pQueueCreateInfos = &qci;
+        VkDeviceQueueCreateInfo qci = {}; qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        qci.queueFamilyIndex = graphicsQf; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+        VkDeviceCreateInfo dci = {}; dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
         const char* extName = name.c_str();
-        dci.enabledExtensionCount = 1;
-        dci.ppEnabledExtensionNames = &extName;
-
+        dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &extName;
         VkDevice dev = VK_NULL_HANDLE;
         r = vkCreateDevice(phys, &dci, nullptr, &dev);
         if (dev) vkDestroyDevice(dev, nullptr);
-        if (r != VK_SUCCESS) {
-            Log("  DISCREPANCY: %s reported supported but create fails: %d\n", extName, r);
-        }
+        if (r != VK_SUCCESS) { Log("  DISCREPANCY: %s -> %d\n", extName, r); discrepancyCount++; }
     }
-    Log("(no discrepancies found = all individual extensions create OK)\n");
+    Log("(%d discrepancies found)\n", discrepancyCount);
 
     vkDestroyInstance(inst, nullptr);
     Log("\n=== Probe complete ===\n");
