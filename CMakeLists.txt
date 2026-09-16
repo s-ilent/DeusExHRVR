@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.24)
+project(vulkan_probe LANGUAGES C CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_WIN32_EXECUTABLE OFF)
+# Force 32-bit (x86) — matches DXHRDC.exe
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+add_executable(vulkan_probe WIN32 src/main.cpp)
+target_link_libraries(vulkan_probe PRIVATE vulkan-1)
+target_compile_definitions(vulkan_probe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(vulkan_probe PRIVATE /W3 /EHsc /utf-8)
