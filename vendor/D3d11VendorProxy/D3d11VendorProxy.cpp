@@ -1245,10 +1245,12 @@ static int PatchNvapiIATInModule(HMODULE hMod, const char* label)
             if (!IsNvapiDllA(dllName)) continue;
             auto* orig = d->pINT
                 ? reinterpret_cast<PIMAGE_THUNK_DATA>(
-                      (d->grAttrs & 1) ? base + d->pINT : d->pINT)
+                      (d->grAttrs & 1) ? (base + d->pINT)
+                                       : reinterpret_cast<BYTE*>(d->pINT))
                 : nullptr;
             auto* thunk = reinterpret_cast<PIMAGE_THUNK_DATA>(
-                (d->grAttrs & 1) ? base + d->pIAT : d->pIAT);
+                (d->grAttrs & 1) ? (base + d->pIAT)
+                                 : reinterpret_cast<BYTE*>(d->pIAT));
             total += PatchNvapiThunks(label, dllName, thunk, orig, base);
         }
     }
