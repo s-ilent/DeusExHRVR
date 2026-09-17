@@ -675,6 +675,13 @@ static PFN_GetProcAddr g_pfnGetProcAddrKB = nullptr;  // KernelBase trampoline
 // Tracked real atidxx module handle — set by GetModuleHandleA hook for diagnostics
 static HMODULE g_hAtidxx = nullptr;
 
+#ifdef BLOCK_NVAPI_STEREO
+// Forward decls — defined in the BLOCK_NVAPI_STEREO section below.
+static bool IsNvapiDllA(LPCSTR s);
+static int  __cdecl NvApiStub();
+static HMODULE g_hNvapi = nullptr;  // real nvapi module, resolved lazily
+#endif
+
 // ---- AMD extension IAT intercept -----------------------------------------
 // TR2013 and similar games have atidxx32.dll as a static import.  After the
 // VendorId spoof they call AmdDxExtCreate11 from system32\atidxx32.dll (the
@@ -854,6 +861,35 @@ static void PatchAmdIAT()
 
 static FARPROC WINAPI HookedGetProcAddr(HMODULE hMod, LPCSTR name)
 {
+#ifdef BLOCK_NVAPI_STEREO
+    // Defense-in-depth: any dynamic NvAPI lookup on the real nvapi module gets
+    // the stub (static imports are already patched via NvapiIAT below).
+    if (hMod)
+    {
+        if (!g_hNvapi)
+        {
+            char fn[MAX_PATH] = {};
+            if (GetModuleFileNameA(hMod, fn, MAX_PATH))
+            {
+                const char* b = fn;
+                for (const char* p = fn; *p; ++p)
+                    if (*p == '\\' || *p == '/') b = p + 1;
+                if (IsNvapiDllA(b))
+                    g_hNvapi = hMod;
+            }
+        }
+        if (g_hNvapi && hMod == g_hNvapi)
+        {
+            char lbuf[160];
+            if (name && !IS_INTRESOURCE(name))
+                wsprintfA(lbuf, "[D3d11Proxy] GetProcAddress(nvapi, %s) -> stub (blocked)\n", name);
+            else
+                wsprintfA(lbuf, "[D3d11Proxy] GetProcAddress(nvapi, ordinal) -> stub (blocked)\n");
+            WriteLog(lbuf);
+            return reinterpret_cast<FARPROC>(&NvApiStub);
+        }
+    }
+#endif
     if (name && !IS_INTRESOURCE(name))
     {
         if (_stricmp(name, "AmdDxExtCreate11") == 0)
@@ -903,6 +939,16 @@ static PFN_GetModuleHandleA g_pfnGetModuleHandleA = nullptr;
 static HMODULE WINAPI HookedGetModuleHandleA(LPCSTR name)
 {
     HMODULE h = g_pfnGetModuleHandleA(name);
+#ifdef BLOCK_NVAPI_STEREO
+    if (name && IsNvapiDllA(name) && h)
+    {
+        // Mimic a real AMD system: nvapi.dll is absent, presence checks fail.
+        char buf[160];
+        wsprintfA(buf, "[D3d11Proxy] GetModuleHandleA(%s) -> NULL (nvapi blocked)\n", name);
+        WriteLog(buf);
+        return NULL;
+    }
+#endif
     if (name)
     {
         char lc[MAX_PATH] = {};
@@ -1103,6 +1149,122 @@ extern "C" __declspec(dllexport) void* __cdecl nvapi_QueryInterface(unsigned int
     wsprintfA(buf, "[D3d11Proxy] nvapi_QueryInterface(0x%08X) -> stub fn\n", id);
     WriteLog(buf);
     return reinterpret_cast<void*>(&NvApiStub);
+}
+
+// ---- NvAPI IAT patching -----------------------------------------------------
+// DXHRDC is an NVIDIA "3D Vision Ready" title: it binds NvAPI through the
+// STATIC import table, so the loader bypasses LoadLibrary* entirely and the
+// load-blocking hooks never fire.  The shipped 2011-era nvapi.dll then
+// initialises without a real NVIDIA driver under Proton and crashes with
+// garbage pointers (same crash class the Tomb Raider block fixes).  Stub
+// every nvapi import — this reproduces a real AMD system, where
+// NvAPI_Initialize fails cleanly and the game falls through to AMD HD3D.
+// Covers both regular and delay-load imports (delay helpers are bypassed
+// because calls dispatch straight through the patched IAT).
+
+typedef struct _NvDelayDescr {
+    DWORD      grAttrs;     // zero or dlattrRva (1)
+    ULONG_PTR  szName;      // DLL name: RVA if dlattrRva, else VA
+    ULONG_PTR  phmod;
+    ULONG_PTR  pIAT;
+    ULONG_PTR  pINT;
+    ULONG_PTR  pBoundIAT;
+    ULONG_PTR  pUnloadIAT;
+    DWORD      dwTimeStamp;
+} NvDelayDescr;
+
+static int PatchNvapiThunks(const char* label, const char* dllName,
+                            PIMAGE_THUNK_DATA thunk, PIMAGE_THUNK_DATA orig,
+                            BYTE* base)
+{
+    int patched = 0;
+    for (; thunk->u1.Function; ++thunk)
+    {
+        char fname[80];
+        if (orig && orig->u1.Function && !(orig->u1.Ordinal & IMAGE_ORDINAL_FLAG))
+        {
+            auto* ibn = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(base + orig->u1.AddressOfData);
+            lstrcpynA(fname, reinterpret_cast<const char*>(ibn->Name), sizeof(fname));
+        }
+        else if (orig && orig->u1.Function)
+            wsprintfA(fname, "ordinal#%u", static_cast<UINT>(orig->u1.Ordinal & 0xFFFF));
+        else
+            lstrcpynA(fname, "import", sizeof(fname));
+
+        DWORD old;
+        VirtualProtect(&thunk->u1.Function, sizeof(void*), PAGE_READWRITE, &old);
+        thunk->u1.Function = reinterpret_cast<ULONG_PTR>(&NvApiStub);
+        VirtualProtect(&thunk->u1.Function, sizeof(void*), old, &old);
+
+        char lbuf[200];
+        wsprintfA(lbuf, "[D3d11Proxy] NvapiIAT[%s] %s: stubbed %s\n", label, dllName, fname);
+        WriteLog(lbuf);
+        ++patched;
+        if (orig) ++orig;
+    }
+    return patched;
+}
+
+static int PatchNvapiIATInModule(HMODULE hMod, const char* label)
+{
+    if (!hMod) return 0;
+    BYTE* base = reinterpret_cast<BYTE*>(hMod);
+    auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    auto* nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    int total = 0;
+
+    // Regular static imports.
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (dir.VirtualAddress)
+    {
+        auto* imp = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(base + dir.VirtualAddress);
+        for (; imp->Name; ++imp)
+        {
+            const char* dllName = reinterpret_cast<const char*>(base + imp->Name);
+            if (!IsNvapiDllA(dllName)) continue;
+            auto* orig = imp->OriginalFirstThunk
+                ? reinterpret_cast<PIMAGE_THUNK_DATA>(base + imp->OriginalFirstThunk)
+                : nullptr;
+            auto* thunk = reinterpret_cast<PIMAGE_THUNK_DATA>(base + imp->FirstThunk);
+            total += PatchNvapiThunks(label, dllName, thunk, orig, base);
+        }
+    }
+
+    // Delay-load imports.
+    auto& ddir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    if (ddir.VirtualAddress)
+    {
+        auto* d = reinterpret_cast<NvDelayDescr*>(base + ddir.VirtualAddress);
+        for (; d->szName; ++d)
+        {
+            const char* dllName = (d->grAttrs & 1)
+                ? reinterpret_cast<const char*>(base + d->szName)
+                : reinterpret_cast<const char*>(d->szName);
+            if (!IsNvapiDllA(dllName)) continue;
+            auto* orig = d->pINT
+                ? reinterpret_cast<PIMAGE_THUNK_DATA>(
+                      (d->grAttrs & 1) ? base + d->pINT : d->pINT)
+                : nullptr;
+            auto* thunk = reinterpret_cast<PIMAGE_THUNK_DATA>(
+                (d->grAttrs & 1) ? base + d->pIAT : d->pIAT);
+            total += PatchNvapiThunks(label, dllName, thunk, orig, base);
+        }
+    }
+    return total;
+}
+
+static void PatchNvapiIAT()
+{
+    int n = PatchNvapiIATInModule(GetModuleHandleW(nullptr), "exe");
+    n += PatchNvapiIATInModule(GetModuleHandleW(L"dfengine.dll"), "dfengine");
+    char b[160];
+    if (n)
+        wsprintfA(b, "[D3d11Proxy] NvapiIAT: %d import(s) stubbed -> NvAPI unavailable (AMD emulation)\n", n);
+    else
+        wsprintfA(b, "[D3d11Proxy] NvapiIAT: no nvapi static/delay imports found\n");
+    WriteLog(b);
 }
 #endif // BLOCK_NVAPI_STEREO
 // Only checks the basename (after last \ or /) to avoid false positives from
@@ -2371,6 +2533,11 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         WriteLog("[D3d11Proxy] MH_Initialize OK\n");
         InstallDxgiHooks();
         PatchAmdIAT();
+#ifdef BLOCK_NVAPI_STEREO
+        // DXHRDC reaches NvAPI through its static import table (the loader
+        // bypasses LoadLibrary*), so load-blocking alone never fires there.
+        PatchNvapiIAT();
+#endif
         InstallGetProcHook();
         InstallRegistryHooks();
     }
@@ -2641,6 +2808,10 @@ extern "C" HRESULT WINAPI D3D11CreateDevice(
         wsprintfA(fbuf, "[D3d11Proxy] D3D11CreateDevice fn=%p self=%p\n",
                   (void*)fn, (void*)&D3D11CreateDevice);
         WriteLog(fbuf);
+#ifdef BLOCK_NVAPI_STEREO
+        // Engine DLL may have loaded after DllMain — cover its nvapi imports.
+        PatchNvapiIATInModule(GetModuleHandleW(L"dfengine.dll"), "dfengine-late");
+#endif
     }
     // Recursion guard — middleware (e.g. Epic overlay) may hook the real
     // d3d11.dll and call back through our proxy.  Allow exactly ONE
